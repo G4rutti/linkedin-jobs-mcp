@@ -1,0 +1,36 @@
+# Auditoria — linkedin-jobs-mcp
+
+Data: 16 de novembro de 2026
+Escopo: `src/*.ts`, `scripts/*.mjs`, `package.json`. Base: o fluxo de login e as travas do [familysearch-mcp](https://github.com/G4rutti/familysearch-mcp), mais as funções de vaga e a detecção de bloqueio do [eliasbiondo/linkedin-mcp-server](https://github.com/eliasbiondo/linkedin-mcp-server).
+
+## Resumo
+
+Servidor só de leitura: nenhuma ferramenta candidata, manda mensagem, conecta ou posta. O maior risco não é de código, é de conta. O LinkedIn proíbe cliente automatizado, e por isso a busca e o detalhe da vaga usam os endpoints públicos **sem os seus cookies**. A sessão só é usada nos extras do `get-job-details` quando você está logado.
+
+| # | Trava | Teste |
+|---|---|---|
+| 1 | Cookie só vai pra `https://*.linkedin.com` (barra `linkedin.com.evil.com`, `evillinkedin.com`, `http://`) | *never sends cookies to a non-LinkedIn URL* |
+| 2 | Redirect seguido à mão, até 5 saltos, e cada salto checado | *does not follow a redirect off linkedin.com* |
+| 3 | Busca e detalhe público não mandam cookie nenhum | *public endpoints never carry the session cookie* |
+| 4 | 429/999: sem nova tentativa, pausa de 15 min | *rate limit pauses everything and does not retry* |
+| 5 | Redirect pra `/checkpoint` ou `/challenge` também pausa (vindo do eliasbiondo) | *a security checkpoint redirect triggers the pause* |
+| 6 | Redirect pra `/login`, `/authwall` ou `/uas/login` = sessão expirada | *authwall redirect means the session expired* |
+| 7 | ID de vaga validado como só dígitos antes de montar a URL | *rejects malformed job ids before any request* |
+
+## Outras decisões
+
+- **Ritmo:** no mínimo ~4 s entre requisições, com até 50% de variação aleatória, uma de cada vez. `maxPages` vai no máximo a 10, e o `fresh-jobs` aceita no máximo 5 termos com 5 páginas cada.
+- **Sem `set-session-cookie`:** no familysearch, essa ferramenta faz os cookies passarem pela conversa com a IA (achado 8 de lá). Aqui ela não existe, então o único caminho é o `login-with-browser`, que grava direto no arquivo local.
+- **Arquivos:** `~/.linkedin-jobs-mcp/` com permissão 0700, `config.json` e `state.json` com 0600 e gravação atômica (arquivo temporário e depois `rename`). No Windows o `chmod` não tem efeito, igual ao achado 9 do familysearch.
+- **`state.json`:** guarda só as buscas salvas e os IDs de vaga já vistos, no máximo 5000. Nada de cookie.
+- **Processo filho:** `spawn(process.execPath, [script fixo])`, sem shell.
+- **Login:** só os cookies de `linkedin.com` são salvos. O `li_at` sozinho não basta: o script espera o `/voyager/api/me` responder, pra não salvar um login pela metade (2FA ou checkpoint).
+- **Erros:** as mensagens são montadas a partir de status e caminho, nunca com cookie.
+- **Sem perfis de pessoas:** o eliasbiondo tem `get_person_profile` e `search_people`. Ficaram de fora porque não servem pra procurar vaga e coletam dado de terceiros.
+
+## Não verificado ao vivo
+
+- Os extras logados do `get-job-details` (`/voyager/api/jobs/jobPostings/{id}`): o endpoint e os campos (`listedAt`, `applies`, `applyMethod`, `applyingInfo.applied`) vêm de bibliotecas conhecidas, não de uma sessão real. Se falhar, a ferramenta devolve uma nota e segue com os dados públicos.
+- O `npm run login` não foi rodado (exige o seu navegador e a sua conta).
+
+Busca, detalhe público, `fresh-jobs` e a marcação de vaga vista foram testados contra o LinkedIn real em 16/11/2026.
