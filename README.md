@@ -16,6 +16,8 @@ Login works like [familysearch-mcp](https://github.com/G4rutti/familysearch-mcp)
 | `save-search` / `list-saved-searches` / `delete-saved-search` | Keep up to 30 named searches. |
 | `set-profile` / `get-profile` / `clear-profile` | Who you are: seniority, years, skills, languages with CEFR level, whether you need a visa. Stored in `~/.linkedin-jobs-mcp/profile.json`. |
 | `import-profile` | Fills the profile from the real thing. No arguments: reads **your own** LinkedIn profile through the saved session. With `text`: parses a CV or LinkedIn "Save to PDF" text. |
+| `get-person-profile` | Reads a LinkedIn profile **by sections**. Always: name, headline, location, followers, connections (own), about, photo, skills, certifications. Optional `sections`: `experience`, `education`, `contact_info`, `interests` (followed companies and groups), `honors`, `languages`, `posts`, `recommendations` (received and given). No `username` = your own profile. |
+| `get-company-profile` | Reads a company page. Always: overview, website, industry, size, headquarters, specialties, followers, logo. Optional `sections`: `posts` (with reactions and comments), `jobs` (open positions). |
 | `triage-jobs` | Opens up to 10 postings and ranks them `good` / `stretch` / `unknown` / `blocked` against your profile, with the reasons. |
 | `check-saved-searches` | Runs saved searches over the time since the last check and returns only jobs never seen before. |
 
@@ -125,3 +127,11 @@ npm test
 ## License
 
 MIT
+
+## Reading profiles and companies
+
+`get-person-profile` and `get-company-profile` call LinkedIn's internal web API with your saved session, one request at a time and with the same pacing and cooldown as the rest of the server. Each section fails on its own: if LinkedIn changes one endpoint, that section shows up under `errors` and the others still come back. Notes:
+
+- Names, headlines and job text come in English when LinkedIn stores an English version; skill names come in the language of your account (common ones are mapped to English).
+- People you follow are not exposed by the endpoint, only followed companies and groups. LinkedIn may return fewer skills than the profile lists (`skillsNote` says so).
+- Reading other people's profiles with your session is a grey area of LinkedIn's terms and can get an account restricted. Use it lightly.

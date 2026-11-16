@@ -10,6 +10,7 @@ import { LinkedInHttpClient } from './http-client.js';
 import { DATE_POSTED, EXPERIENCE, JOB_TYPE, LinkedInJobs, SORT, WORK_TYPE } from './linkedin.js';
 import { JobWatcher } from './watch.js';
 import { fetchOwnProfile, importFromText } from './profile-import.js';
+import { COMPANY_SECTIONS, PERSON_SECTIONS, companyFrom, fetchCompany, fetchPerson, usernameFrom } from './person.js';
 import { LANG_LEVELS, SENIORITY, analyzeFit, clearProfile, loadProfile, profileExcludes, profilePath, saveProfile, type Profile } from './profile.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -38,7 +39,7 @@ function currentCookies(): string {
 const http = new LinkedInHttpClient({ getCookies: currentCookies });
 const jobs = new LinkedInJobs(http, () => profileExcludes(loadProfile()));
 const watcher = new JobWatcher(jobs);
-const server = new McpServer({ name: 'linkedin-jobs', version: '0.3.0' });
+const server = new McpServer({ name: 'linkedin-jobs', version: '0.4.0' });
 
 const text = (value: unknown) => ({
   content: [{ type: 'text' as const, text: typeof value === 'string' ? value : JSON.stringify(value, null, 2) }],
@@ -218,6 +219,39 @@ server.tool(
         droppedTitleWords: profileExcludes(merged) ?? [],
         ...(debug || !(found.yearsExperience !== undefined && found.skills?.length) ? { diagnostics } : {}),
       };
+    }),
+);
+
+server.tool(
+  'get-person-profile',
+  "Read a LinkedIn profile by sections, through your saved login. The main block (name, headline, location, followers, connections, about, photo, skills, certifications) always comes back; ask only for the sections you need: experience, education, contact_info, interests, honors, languages, posts, recommendations. Without `username` it reads YOUR OWN profile. With a username it reads that public profile as seen by your account (contact info only if you are connected). Each section fails on its own: a failure shows up under `errors` and the rest still returns.",
+  {
+    username: z.string().max(200).optional().describe('Part after /in/ (or the full profile URL). Omit for your own profile.'),
+    sections: z.array(z.enum(PERSON_SECTIONS)).default([...PERSON_SECTIONS].filter((s) => s !== 'posts')).describe(`Sections to fetch (${PERSON_SECTIONS.join(', ')}). Default: all except posts.`),
+    postsLimit: z.number().int().min(1).max(20).default(5),
+  },
+  ({ username, sections, postsLimit }) =>
+    run(async () => {
+      currentCookies();
+      if (!http.hasSession()) throw new Error('Not logged in. Run login-with-browser first.');
+      const d = new Date();
+      return fetchPerson(http, { username: username ? usernameFrom(username) : undefined, sections, postsLimit }, { y: d.getFullYear(), m: d.getMonth() + 1 });
+    }),
+);
+
+server.tool(
+  'get-company-profile',
+  'Read a LinkedIn company page. The about block (overview, website, industry, size, headquarters, specialties, followers, logo) always comes back; sections: posts (recent feed posts with reactions/comments), jobs (open positions).',
+  {
+    company: z.string().min(1).max(200).describe('Part after /company/ (e.g. "epharma") or the full company URL.'),
+    sections: z.array(z.enum(COMPANY_SECTIONS)).default([]),
+    limit: z.number().int().min(1).max(20).default(5),
+  },
+  ({ company, sections, limit }) =>
+    run(async () => {
+      currentCookies();
+      if (!http.hasSession()) throw new Error('Not logged in. Run login-with-browser first.');
+      return fetchCompany(http, { company: companyFrom(company), sections, limit });
     }),
 );
 
