@@ -15,6 +15,13 @@ const loginScriptPath = join(__dirname, '..', 'scripts', 'browser-login.mjs');
 
 // `npm run login` writes the session from another process: pick up a newer
 // config file without restarting the MCP client (same as familysearch-mcp).
+// `npx github:G4rutti/linkedin-jobs-mcp --login` runs the browser login and exits.
+if (process.argv.includes('--login')) {
+  const child = spawn(process.execPath, [loginScriptPath], { stdio: 'inherit' });
+  child.on('close', (code) => process.exit(code ?? 1));
+  await new Promise(() => {});
+}
+
 let session: SessionConfig = loadSession();
 let sessionMtime = configMtimeMs();
 function currentCookies(): string {

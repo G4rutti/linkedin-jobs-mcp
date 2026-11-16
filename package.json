@@ -4,22 +4,37 @@
   "description": "Read-only LinkedIn job search MCP server with browser-session login, fresh-job alerts and saved searches",
   "type": "module",
   "main": "build/index.js",
-  "bin": { "linkedin-jobs-mcp": "build/index.js" },
+  "bin": {
+    "linkedin-jobs-mcp": "build/index.js"
+  },
   "scripts": {
     "build": "tsc",
+    "prepare": "tsc",
     "start": "node ./build/index.js",
     "login": "node ./scripts/browser-login.mjs",
     "test": "npm run build && node --test build/*.test.js"
   },
-  "files": ["build", "scripts"],
+  "files": [
+    "build",
+    "scripts",
+    "!build/*.test.js"
+  ],
   "license": "MIT",
-  "repository": { "type": "git", "url": "git+https://github.com/G4rutti/linkedin-jobs-mcp.git" },
-  "engines": { "node": ">=18" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/G4rutti/linkedin-jobs-mcp.git"
+  },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",
     "cheerio": "^1.0.0",
     "playwright": "^1.51.1",
     "zod": "^4.6.7"
   },
-  "devDependencies": { "@types/node": "^22.13.11", "typescript": "^5.8.2" }
+  "devDependencies": {
+    "@types/node": "^22.13.11",
+    "typescript": "^5.8.2"
+  }
 }

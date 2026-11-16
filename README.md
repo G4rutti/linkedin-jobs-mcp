@@ -18,17 +18,53 @@ Login works like [familysearch-mcp](https://github.com/G4rutti/familysearch-mcp)
 
 ## Install
 
+### Claude Code (npx, no clone)
+
+```bash
+claude mcp add linkedin-jobs --scope user -- npx -y github:G4rutti/linkedin-jobs-mcp
+```
+
+Optional login (needed only for the logged-in extras in `get-job-details`):
+
+```bash
+npx -y github:G4rutti/linkedin-jobs-mcp --login
+```
+
+Then run `/mcp` inside Claude Code to check it is connected. You can also call the `login-with-browser` tool from the chat.
+
+### Claude Desktop / Cursor / other MCP clients
+
+```json
+{
+  "mcpServers": {
+    "linkedin-jobs": {
+      "command": "npx",
+      "args": ["-y", "github:G4rutti/linkedin-jobs-mcp"]
+    }
+  }
+}
+```
+
+### From source
+
 ```bash
 git clone https://github.com/G4rutti/linkedin-jobs-mcp && cd linkedin-jobs-mcp
 npm install && npm run build
-npm run login   # optional; needed only for logged-in extras
+npm run login   # optional
+claude mcp add linkedin-jobs --scope user -- node "$(pwd)/build/index.js"
 ```
 
-Playwright does not download a browser: it uses the Brave/Chrome you already have (`LINKEDIN_BROWSER_PATH` to override).
+Requirements: Node 18+. Playwright does not download a browser: login uses the Brave/Chrome you already have (`LINKEDIN_BROWSER_PATH` to override). The first `npx` run takes a bit longer because it installs and compiles the package.
 
-```json
-{ "mcpServers": { "linkedin-jobs": { "command": "node", "args": ["/absolute/path/to/linkedin-jobs-mcp/build/index.js"] } } }
-```
+### Environment variables
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `LINKEDIN_MIN_INTERVAL_MS` | `4000` | Minimum gap between requests (jitter is added on top). |
+| `LINKEDIN_BROWSER_PATH` | auto | Browser used by the login. |
+| `LINKEDIN_JOBS_MCP_DIR` | `~/.linkedin-jobs-mcp` | Where the session and saved searches live. |
+
+With Claude Code: `claude mcp add linkedin-jobs --scope user -e LINKEDIN_MIN_INTERVAL_MS=6000 -- npx -y github:G4rutti/linkedin-jobs-mcp`
 
 ## Safety
 
