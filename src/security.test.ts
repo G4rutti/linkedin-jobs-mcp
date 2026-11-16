@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { LinkedInHttpClient, RateLimitError, SessionExpiredError, BlockedUrlError } from './http-client.js';
-import { assertJobId, buildSearchQuery, parseAgo, visaSignals, LinkedInJobs } from './linkedin.js';
+import { assertJobId, buildSearchQuery, parseAgo, visaSignals, LinkedInJobs, normalizeKeywords, titleExcluded } from './linkedin.js';
 import { JobWatcher } from './watch.js';
 import type { WatchState } from './config.js';
 
@@ -103,4 +103,28 @@ test('fresh-jobs flags new vs seen and check-saved only returns unseen', async (
   const check = await w.checkSaved();
   assert.deepEqual(check.results[0].newJobs.map((j) => j.id), ['1000003']);
   assert.ok(state.savedSearches[0].lastCheckedAt);
+});
+
+test('normalizeKeywords fixes curly quotes, lowercase operators and wildcards', () => {
+  const r = normalizeKeywords('\u201Cfull stack\u201D or react* and not "research and development"');
+  assert.equal(r.query, '"full stack" OR react AND NOT "research and development"');
+  assert.ok(r.warnings.some((w) => /Curly/.test(w)));
+  assert.ok(r.warnings.some((w) => /Wildcards/.test(w)));
+  assert.ok(r.warnings.some((w) => /parentheses: precedence/.test(w)));
+  assert.deepEqual(normalizeKeywords('("a" OR b) AND c').warnings, []);
+  assert.ok(normalizeKeywords('(a OR b').warnings.some((w) => /Unbalanced parentheses/.test(w)));
+});
+
+test('under10Applicants maps to f_EA and keywords are normalized in the URL', () => {
+  const q = buildSearchQuery({ keywords: 'react or vue', under10Applicants: true });
+  assert.equal(q.get('f_EA'), 'true');
+  assert.equal(q.get('keywords'), 'react OR vue');
+});
+
+test('titleExcluded matches whole words only', () => {
+  assert.equal(titleExcluded('Senior Full Stack Engineer', ['senior']), true);
+  assert.equal(titleExcluded('(Senior) Full-Stack Developer', ['senior']), true);
+  assert.equal(titleExcluded('Full Stack Engineer', ['senior', 'lead']), false);
+  assert.equal(titleExcluded('Leading Edge Full Stack Developer', ['lead']), false);
+  assert.equal(titleExcluded('Internal Tools Developer', ['intern']), false);
 });

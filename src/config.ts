@@ -21,6 +21,8 @@ export interface SavedSearch {
   experienceLevel?: string;
   jobType?: string;
   easyApply?: boolean;
+  under10Applicants?: boolean;
+  excludeTitle?: string[];
   createdAt: string;
   lastCheckedAt?: string;
 }

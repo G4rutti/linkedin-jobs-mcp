@@ -10,11 +10,42 @@ Login works like [familysearch-mcp](https://github.com/G4rutti/familysearch-mcp)
 | --- | --- |
 | `login-with-browser` | Opens Brave/Chrome with a separate profile; you log in; cookies go to `~/.linkedin-jobs-mcp/config.json` (0600). |
 | `session-status` / `logout` | Check or delete the saved session. |
-| `search-jobs` | Filters: `location`, `datePosted` (past_hour … past_month), `jobType`, `experienceLevel`, `workType`, `easyApply`, `sortBy`, `maxPages` (1-10). |
-| `get-job-details` | Description, criteria, applicants, `visaMentions` / `visaNegatives`. Logged in: exact publish time, applicant count, Easy Apply, whether you already applied. |
+| `search-jobs` | Filters: `location`, `datePosted` (past_hour … past_month), `jobType`, `experienceLevel`, `workType`, `easyApply`, `under10Applicants`, `excludeTitle`, `sortBy`, `maxPages` (1-10). |
+| `get-job-details` | Description, criteria, applicants, `visaMentions` / `visaNegatives`. Logged in: exact publish time, applicant count, Easy Apply, whether you already applied. With a profile: a `fit` check. |
 | `fresh-jobs` | Jobs posted in the last N minutes (default 60) for up to 5 keyword sets at once, newest first, each flagged `isNew`. |
 | `save-search` / `list-saved-searches` / `delete-saved-search` | Keep up to 30 named searches. |
+| `set-profile` / `get-profile` / `clear-profile` | Who you are: seniority, years, skills, languages with CEFR level, whether you need a visa. Stored in `~/.linkedin-jobs-mcp/profile.json`. |
+| `triage-jobs` | Opens up to 10 postings and ranks them `good` / `stretch` / `unknown` / `blocked` against your profile, with the reasons. |
 | `check-saved-searches` | Runs saved searches over the time since the last check and returns only jobs never seen before. |
+
+## Profile and fit check
+
+Tell the server who you are once, for example:
+
+```json
+{ "seniority": "junior", "yearsExperience": 1, "skills": ["React", "TypeScript", "Node.js"],
+  "languages": { "en": "C1", "pt": "native", "de": "none" }, "needsVisa": true }
+```
+
+- **Title filter.** Your seniority picks the title words that get dropped from every search: a junior never sees "Senior", "Lead", "Staff" or "Werkstudent"; a senior never sees "Junior" or "Intern". Words are matched in EN, DE, NL, PT, FR and ES. Add your own with `excludeTitle`, rescue words with `includeTitle`, or pass `excludeTitle: []` on one call to switch it off.
+- **Fit check.** `get-job-details` and `triage-jobs` read the ad and report:
+  - years of experience asked (`3+ years`, `≥ 3 Jahre`, `minimaal 2 jaar`…) against yours;
+  - languages asked, with CEFR level (`Deutsch verhandlungssicher` = C2), plus the language the ad is written in, against yours;
+  - visa: ads that rule it out (`work permit required`, `Arbeitserlaubnis … erforderlich`) are `blocked`, ads that offer it are a plus, silence is flagged;
+  - which of your skills appear in the ad.
+
+It is a heuristic from the ad text, not a verdict: read the `blockers` before trusting a `blocked`.
+
+## Search tips
+
+`keywords` takes LinkedIn Boolean: `AND`, `OR`, `NOT` in uppercase, "straight quotes" for exact phrases and parentheses to group. Precedence is quotes > () > NOT > AND > OR, so always wrap OR lists in parentheses. Wildcards (`*`) and `+`/`-` are not supported. The server fixes curly quotes and lowercase operators on its own and reports what it changed in `warnings`.
+
+Filters on `search-jobs`, `fresh-jobs` and `save-search`:
+
+- `under10Applicants`: LinkedIn's "Under 10 applicants" filter, for applying while you are still early.
+- `excludeTitle`: drops jobs whose title has any of the given words, e.g. `["manager", "sap"]`. Without it, the words come from your profile. LinkedIn tends to ignore `NOT` in complex queries, so this filter is the reliable way to exclude titles.
+
+Visa: search for `("visa sponsorship" OR "relocation")`, never the bare word "sponsorship". A keyword hit is not proof, so check `visaMentions` / `visaNegatives` in `get-job-details`.
 
 ## Install
 

@@ -32,12 +32,62 @@ export interface SearchParams {
   experienceLevel?: string; // comma-separated keys of EXPERIENCE
   workType?: string; // comma-separated keys of WORK_TYPE
   easyApply?: boolean;
+  under10Applicants?: boolean; // LinkedIn's "Under 10 applicants" filter (f_EA)
+  excludeTitle?: string[]; // drop cards whose title contains any of these words (backs up NOT)
   sortBy?: keyof typeof SORT;
   maxPages?: number;
 }
 
+/**
+ * LinkedIn keyword Boolean: AND / OR / NOT (uppercase), "straight quotes" and (parentheses).
+ * No wildcards, no +/-. Curly quotes silently break phrase matching, so we fix them here.
+ */
+export function normalizeKeywords(raw: string): { query: string; warnings: string[] } {
+  const warnings: string[] = [];
+  let q = String(raw ?? '');
+  const curly = /[\u201C\u201D\u201E\u201F\u2033\u00AB\u00BB]/g;
+  if (curly.test(q)) {
+    q = q.replace(curly, '"');
+    warnings.push('Curly quotes replaced with straight quotes.');
+  }
+  q = q.replace(/[\u2018\u2019]/g, "'");
+  if (/\*/.test(q)) {
+    q = q.replace(/\*/g, '');
+    warnings.push('Wildcards (*) are not supported by LinkedIn and were removed.');
+  }
+  if (/(^|\s)[+-](?=\w)/.test(q)) warnings.push('+/- operators are not supported by LinkedIn; use AND / NOT.');
+  // Uppercase and/or/not outside quoted phrases: lowercase operators are read as plain words.
+  let fixedCase = false;
+  q = q
+    .split(/("[^"]*")/)
+    .map((part) =>
+      part.startsWith('"') ? part : part.replace(/\b(and|or|not)\b/g, (m) => ((fixedCase = true), m.toUpperCase())),
+    )
+    .join('');
+  if (fixedCase) warnings.push('Lowercase and/or/not were turned into AND/OR/NOT operators.');
+  q = q.replace(/\s+/g, ' ').trim();
+  if ((q.match(/"/g) ?? []).length % 2) warnings.push('Unbalanced quotes: the phrase search may be ignored.');
+  let depth = 0;
+  for (const ch of q) if (ch === '(') depth++; else if (ch === ')' && --depth < 0) break;
+  if (depth !== 0) warnings.push('Unbalanced parentheses: LinkedIn may scramble the OR/AND logic.');
+  if (/\b(AND|OR)\b/.test(q) && /\bOR\b/.test(q) && /\bAND\b/.test(q) && !q.includes('('))
+    warnings.push('Mixing AND with OR without parentheses: precedence is quotes > () > NOT > AND > OR.');
+  return { query: q, warnings };
+}
+
+export function titleExcluded(title: string, words: string[] | undefined): boolean {
+  if (!words?.length) return false;
+  const t = title.toLowerCase();
+  return words.some((w) => {
+    const word = w.trim().toLowerCase();
+    if (!word) return false;
+    const esc = word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`(^|[^\\p{L}\\p{N}])${esc}($|[^\\p{L}\\p{N}])`, 'u').test(t);
+  });
+}
+
 export function buildSearchQuery(p: SearchParams, start = 0): URLSearchParams {
-  const q = new URLSearchParams({ keywords: p.keywords });
+  const q = new URLSearchParams({ keywords: normalizeKeywords(p.keywords).query });
   if (p.location) q.set('location', p.location);
   const seconds = p.postedWithinMinutes ? Math.round(p.postedWithinMinutes * 60) : p.datePosted ? DATE_POSTED[p.datePosted] : 0;
   if (seconds) q.set('f_TPR', `r${seconds}`);
@@ -48,6 +98,7 @@ export function buildSearchQuery(p: SearchParams, start = 0): URLSearchParams {
   const wt = mapList(p.workType, WORK_TYPE);
   if (wt) q.set('f_WT', wt);
   if (p.easyApply) q.set('f_AL', 'true');
+  if (p.under10Applicants) q.set('f_EA', 'true');
   if (p.sortBy) q.set('sortBy', SORT[p.sortBy]);
   if (start) q.set('start', String(start));
   return q;
@@ -108,8 +159,8 @@ export function parseSearchHtml(html: string): JobCard[] {
 
 // Phrases that mean the ad itself says it sponsors a visa / relocates you.
 const VISA =
-  /(visa sponsor\w*|sponsor\w* (?:a |your |the )?(?:work )?visas?|work permits?|relocation (?:package|support|assistance|bonus)|relocat\w+ (?:support|assistance|offered)|blue card|we (?:will )?sponsor|patroc\w+ (?:de )?visto)/gi;
-const NO_VISA = /(no visa sponsorship|not (?:able to |)(?:offer|provide) (?:visa )?sponsorship|unable to sponsor|do(?:es)? not sponsor|without (?:the need for )?(?:visa )?sponsorship|must (?:already )?have (?:the )?right to work)/gi;
+  /(visa sponsor\w*|sponsor\w* (?:a |your |the )?(?:work )?visas?|help with (?:the )?work permit|relocation (?:package|support|assistance|bonus)|relocat\w+ (?:support|assistance|offered)|blue card|we (?:will )?sponsor|patroc\w+ (?:de )?visto)/gi;
+const NO_VISA = /(no visa sponsorship|not (?:able to |)(?:offer|provide) (?:visa )?sponsorship|unable to sponsor|do(?:es)? not sponsor|without (?:the need for )?(?:visa )?sponsorship|must (?:already )?have (?:the )?right to work|(?:valid )?work permits? (?:is )?required|(?:already )?(?:eligible|authori[sz]ed|have the right) to work in|arbeitserlaubnis[^.]{0,40}erforderlich|werkvergunning[^.]{0,30}vereist)/gi;
 
 export function visaSignals(text: string): { mentions: string[]; negatives: string[] } {
   const uniq = (m: RegExpMatchArray | null) => [...new Set((m ?? []).map((s) => s.toLowerCase()))];
@@ -144,22 +195,41 @@ export function parseJobHtml(id: string, html: string) {
 }
 
 export class LinkedInJobs {
-  constructor(private http: LinkedInHttpClient) {}
+  constructor(
+    private http: LinkedInHttpClient,
+    // Title words to drop when a call does not pass excludeTitle (from the user's profile).
+    private defaultExclude: () => string[] | undefined = () => undefined,
+  ) {}
 
   async search(p: SearchParams) {
     const maxPages = Math.max(1, Math.min(p.maxPages ?? 1, 10));
     const seen = new Set<string>();
     const jobs: JobCard[] = [];
+    const { warnings } = normalizeKeywords(p.keywords);
+    const exclude = p.excludeTitle ?? this.defaultExclude();
+    let excludedByTitle = 0;
     let start = 0;
     for (let page = 0; page < maxPages; page++) {
       // Public endpoints: no cookies, so scraping is never tied to your account.
       const res = await this.http.get(`${GUEST}/seeMoreJobPostings/search?${buildSearchQuery(p, start)}`, { useSession: false });
       const cards = parseSearchHtml(res.text);
       if (!cards.length) break;
-      for (const c of cards) if (!seen.has(c.id)) (seen.add(c.id), jobs.push(c));
+      for (const c of cards) {
+        if (seen.has(c.id)) continue;
+        seen.add(c.id);
+        if (titleExcluded(c.title, exclude)) excludedByTitle++;
+        else jobs.push(c);
+      }
       start += cards.length;
     }
-    return { query: Object.fromEntries(buildSearchQuery(p)), returned: jobs.length, nextStart: start, jobs };
+    return {
+      query: Object.fromEntries(buildSearchQuery(p)),
+      ...(warnings.length ? { warnings } : {}),
+      returned: jobs.length,
+      ...(excludedByTitle ? { excludedByTitle } : {}),
+      nextStart: start,
+      jobs,
+    };
   }
 
   async details(rawId: string) {

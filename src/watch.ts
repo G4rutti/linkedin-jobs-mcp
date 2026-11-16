@@ -25,6 +25,8 @@ export class JobWatcher {
     const nowIso = new Date(this.now()).toISOString();
     const byId = new Map<string, FreshJob>();
     const errors: string[] = [];
+    const warnings = new Set<string>();
+    let excludedByTitle = 0;
 
     for (const kw of opts.keywords) {
       try {
@@ -35,6 +37,8 @@ export class JobWatcher {
           sortBy: 'date',
           maxPages: opts.maxPages ?? 2,
         });
+        res.warnings?.forEach((w) => warnings.add(`${kw}: ${w}`));
+        excludedByTitle += res.excludedByTitle ?? 0;
         for (const job of res.jobs) {
           if (byId.has(job.id)) continue;
           byId.set(job.id, { ...job, isNew: !state.seen[job.id], matchedKeywords: kw });
@@ -55,6 +59,8 @@ export class JobWatcher {
       withinMinutes: opts.withinMinutes,
       total: list.length,
       newCount: list.filter((j) => j.isNew).length,
+      ...(excludedByTitle ? { excludedByTitle } : {}),
+      ...(warnings.size ? { warnings: [...warnings] } : {}),
       jobs: list,
       ...(errors.length ? { errors } : {}),
     };
@@ -103,6 +109,8 @@ export class JobWatcher {
         experienceLevel: s.experienceLevel,
         jobType: s.jobType,
         easyApply: s.easyApply,
+        under10Applicants: s.under10Applicants,
+        excludeTitle: s.excludeTitle,
         withinMinutes,
         onlyNew: true,
         maxPages: 3,

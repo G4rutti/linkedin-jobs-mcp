@@ -9,6 +9,7 @@ import { clearSession, configMtimeMs, configPath, loadSession, type SessionConfi
 import { LinkedInHttpClient } from './http-client.js';
 import { DATE_POSTED, EXPERIENCE, JOB_TYPE, LinkedInJobs, SORT, WORK_TYPE } from './linkedin.js';
 import { JobWatcher } from './watch.js';
+import { LANG_LEVELS, SENIORITY, analyzeFit, clearProfile, loadProfile, profileExcludes, profilePath, saveProfile, type Profile } from './profile.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const loginScriptPath = join(__dirname, '..', 'scripts', 'browser-login.mjs');
@@ -34,9 +35,9 @@ function currentCookies(): string {
 }
 
 const http = new LinkedInHttpClient({ getCookies: currentCookies });
-const jobs = new LinkedInJobs(http);
+const jobs = new LinkedInJobs(http, () => profileExcludes(loadProfile()));
 const watcher = new JobWatcher(jobs);
-const server = new McpServer({ name: 'linkedin-jobs', version: '0.1.0' });
+const server = new McpServer({ name: 'linkedin-jobs', version: '0.2.0' });
 
 const text = (value: unknown) => ({
   content: [{ type: 'text' as const, text: typeof value === 'string' ? value : JSON.stringify(value, null, 2) }],
@@ -63,7 +64,16 @@ const filters = {
   experienceLevel: csvOf(Object.keys(EXPERIENCE), 'Experience level'),
   workType: csvOf(Object.keys(WORK_TYPE), 'Work type'),
   easyApply: z.boolean().optional().describe('Only Easy Apply jobs'),
+  under10Applicants: z.boolean().optional().describe("LinkedIn's 'Under 10 applicants' filter: apply while you are still early"),
+  excludeTitle: z
+    .array(z.string().min(1).max(40))
+    .max(20)
+    .optional()
+    .describe("Drop jobs whose title contains any of these words (whole words). Omit to use the words derived from your profile (set-profile); pass [] to turn title filtering off. Backs up NOT, which LinkedIn ignores in complex queries."),
 };
+
+const KEYWORDS_HELP =
+  'LinkedIn Boolean: AND / OR / NOT in uppercase, "straight quotes" for exact phrases, (parentheses) to group. Precedence: quotes > () > NOT > AND > OR, so wrap OR lists in (). No wildcards (*) or +/-. Curly quotes and lowercase operators are fixed automatically and reported in warnings. Visa tip: ("visa sponsorship" OR "relocation"), never bare "sponsorship".';
 
 // ── Session (pattern from familysearch-mcp) ───────────────────────────────────
 
@@ -114,7 +124,7 @@ server.tool(
   'search-jobs',
   'Search LinkedIn jobs. Returns job ids for get-job-details. Public endpoint, no cookies sent.',
   {
-    keywords: z.string().min(1).max(200),
+    keywords: z.string().min(1).max(200).describe(KEYWORDS_HELP),
     ...filters,
     datePosted: z.enum(Object.keys(DATE_POSTED) as [keyof typeof DATE_POSTED]).optional(),
     sortBy: z.enum(Object.keys(SORT) as [keyof typeof SORT]).optional(),
@@ -127,7 +137,84 @@ server.tool(
   'get-job-details',
   'Full posting: description, criteria, applicants, visaMentions (visa/relocation phrases in the ad; empty = not stated) and visaNegatives. When logged in, adds exact publish time, applicant count and whether you already applied.',
   { jobId: z.string().regex(/^\d{6,15}$/, 'Numeric LinkedIn job id').describe('Job id from search-jobs or fresh-jobs') },
-  ({ jobId }) => run(() => jobs.details(jobId)),
+  ({ jobId }) =>
+    run(async () => {
+      const job = await jobs.details(jobId);
+      const profile = loadProfile();
+      return profile ? { ...job, fit: analyzeFit(job, profile) } : job;
+    }),
+);
+
+// ── Profile: who is searching (any user) ──────────────────────────────────────
+
+server.tool(
+  'set-profile',
+  'Save who you are once (seniority, years, skills, languages, visa need). Then searches drop titles out of your reach and get-job-details / triage-jobs add a fit check. Fields you omit keep their current value. Stored only on this machine.',
+  {
+    seniority: z.enum(SENIORITY).optional().describe('intern | junior | mid | senior | lead. Drives which title words are dropped.'),
+    yearsExperience: z.number().min(0).max(50).optional(),
+    skills: z.array(z.string().min(1).max(40)).max(40).optional().describe("e.g. ['React','TypeScript','Node.js','Python']"),
+    languages: z
+      .record(z.string().regex(/^[a-z]{2}$/, 'ISO 639-1 code like en, de, nl, pt'), z.enum(LANG_LEVELS))
+      .optional()
+      .describe("ISO code -> level (none, A1..C2, native), e.g. { en: 'C1', pt: 'native', de: 'none' }"),
+    needsVisa: z.boolean().optional().describe('true if you need sponsorship to work where you are searching'),
+    excludeTitle: z.array(z.string().min(1).max(40)).max(30).optional().describe('Extra title words to always drop'),
+    includeTitle: z.array(z.string().min(1).max(40)).max(30).optional().describe("Words to keep even if your seniority would drop them, e.g. ['medior']"),
+  },
+  (args) =>
+    run(() => {
+      const merged: Profile = { ...(loadProfile() ?? {}), ...Object.fromEntries(Object.entries(args).filter(([, v]) => v !== undefined)) };
+      saveProfile(merged);
+      return { saved: merged, droppedTitleWords: profileExcludes(merged) ?? [], file: profilePath };
+    }),
+);
+
+server.tool('get-profile', 'Show the saved profile and the title words it drops from searches.', {}, () =>
+  run(() => {
+    const p = loadProfile();
+    return p ? { profile: p, droppedTitleWords: profileExcludes(p) ?? [] } : 'No profile yet. Use set-profile.';
+  }),
+);
+
+server.tool('clear-profile', 'Delete the saved profile.', {}, () => run(() => (clearProfile() ? 'Profile deleted.' : 'There was no profile.')));
+
+server.tool(
+  'triage-jobs',
+  'Open several postings and rank them against your profile: good, stretch, unknown, blocked, with the reasons (years asked, languages, visa, stack overlap). Use it on ids from search-jobs or fresh-jobs before reading descriptions one by one.',
+  { jobIds: z.array(z.string().regex(/^\d{6,15}$/)).min(1).max(10) },
+  ({ jobIds }) =>
+    run(async () => {
+      const profile = loadProfile();
+      if (!profile) throw new Error('No profile yet. Call set-profile first.');
+      const order = { good: 0, stretch: 1, unknown: 2, blocked: 3 } as const;
+      const rows = [];
+      const errors: string[] = [];
+      for (const id of [...new Set(jobIds)]) {
+        try {
+          const job = await jobs.details(id);
+          const fit = analyzeFit(job, profile);
+          rows.push({
+            id,
+            title: job.title,
+            company: job.company,
+            location: job.location,
+            applicants: job.applicants,
+            closed: job.closed,
+            verdict: fit.verdict,
+            blockers: fit.blockers,
+            stretches: fit.stretches,
+            pluses: fit.pluses,
+            url: job.url,
+          });
+        } catch (error) {
+          if (error instanceof Error && error.name === 'RateLimitError') throw error;
+          errors.push(`${id}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+      rows.sort((a, b) => order[a.verdict] - order[b.verdict] || Number(a.closed) - Number(b.closed));
+      return { ranked: rows, ...(errors.length ? { errors } : {}) };
+    }),
 );
 
 // ── Fresh jobs & saved searches (Davi) ─────────────────────────────────────────
@@ -136,7 +223,7 @@ server.tool(
   'fresh-jobs',
   'Jobs posted in the last N minutes, newest first, for one or more keyword sets at once. Each job is flagged isNew if this server never returned it before.',
   {
-    keywords: z.array(z.string().min(1).max(200)).min(1).max(5).describe("e.g. ['full stack', 'react developer']"),
+    keywords: z.array(z.string().min(1).max(200)).min(1).max(5).describe(`One query per item, e.g. ['full stack', 'react developer']. ${KEYWORDS_HELP}`),
     withinMinutes: z.number().int().min(5).max(10080).default(60).describe('Time window (default 60 = last hour)'),
     ...filters,
     onlyNew: z.boolean().optional().describe('Hide jobs already returned in earlier calls'),
@@ -148,7 +235,7 @@ server.tool(
 server.tool(
   'save-search',
   'Save a search by name so check-saved-searches can report only new jobs. Same name replaces it.',
-  { name: z.string().min(1).max(60), keywords: z.string().min(1).max(200), ...filters },
+  { name: z.string().min(1).max(60), keywords: z.string().min(1).max(200).describe(KEYWORDS_HELP), ...filters },
   (args) => run(() => watcher.saveSearch(args)),
 );
 
