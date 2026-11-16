@@ -15,12 +15,13 @@ Login works like [familysearch-mcp](https://github.com/G4rutti/familysearch-mcp)
 | `fresh-jobs` | Jobs posted in the last N minutes (default 60) for up to 5 keyword sets at once, newest first, each flagged `isNew`. |
 | `save-search` / `list-saved-searches` / `delete-saved-search` | Keep up to 30 named searches. |
 | `set-profile` / `get-profile` / `clear-profile` | Who you are: seniority, years, skills, languages with CEFR level, whether you need a visa. Stored in `~/.linkedin-jobs-mcp/profile.json`. |
+| `import-profile` | Fills the profile from the real thing. No arguments: reads **your own** LinkedIn profile through the saved session. With `text`: parses a CV or LinkedIn "Save to PDF" text. |
 | `triage-jobs` | Opens up to 10 postings and ranks them `good` / `stretch` / `unknown` / `blocked` against your profile, with the reasons. |
 | `check-saved-searches` | Runs saved searches over the time since the last check and returns only jobs never seen before. |
 
 ## Profile and fit check
 
-Tell the server who you are once, for example:
+Run `import-profile` and the server builds the profile for you, or tell it by hand with `set-profile`, for example:
 
 ```json
 { "seniority": "junior", "yearsExperience": 1, "skills": ["React", "TypeScript", "Node.js"],
@@ -33,6 +34,13 @@ Tell the server who you are once, for example:
   - languages asked, with CEFR level (`Deutsch verhandlungssicher` = C2), plus the language the ad is written in, against yours;
   - visa: ads that rule it out (`work permit required`, `Arbeitserlaubnis … erforderlich`) are `blocked`, ads that offer it are a plus, silence is flagged;
   - which of your skills appear in the ad.
+
+### Importing the profile
+
+- **`import-profile` (no arguments)** reads the profile of the account that owns the saved login: jobs with dates, skills and languages. The account comes from LinkedIn's `/me`, never from an input, so it cannot read anybody else's profile. It uses LinkedIn's internal web API, which is undocumented and can change without notice, and reading it with your own session is a grey area of LinkedIn's terms: it is opt-in and only runs when you call it. If it comes back empty, use the text import.
+- **`import-profile` with `text`** takes a CV or the text of LinkedIn's "Save to PDF" and needs no login. Years of experience are the distinct months covered by your jobs (overlaps counted once; education, awards and future dates ignored), seniority comes from your current job title (or from the years if the title says nothing), skills come from the "Skills" section, and languages need an explicit level (`English (C1)`, `Portuguese (Native or Bilingual)`) or they are skipped, never guessed.
+- `needsVisa` is never imported, a profile cannot know it: set it with `set-profile`.
+- It saves by default and returns what it understood (`positions`, `notes`). Pass `save: false` to preview.
 
 It is a heuristic from the ad text, not a verdict: read the `blockers` before trusting a `blocked`.
 

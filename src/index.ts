@@ -9,6 +9,7 @@ import { clearSession, configMtimeMs, configPath, loadSession, type SessionConfi
 import { LinkedInHttpClient } from './http-client.js';
 import { DATE_POSTED, EXPERIENCE, JOB_TYPE, LinkedInJobs, SORT, WORK_TYPE } from './linkedin.js';
 import { JobWatcher } from './watch.js';
+import { fetchOwnProfile, importFromText } from './profile-import.js';
 import { LANG_LEVELS, SENIORITY, analyzeFit, clearProfile, loadProfile, profileExcludes, profilePath, saveProfile, type Profile } from './profile.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -37,7 +38,7 @@ function currentCookies(): string {
 const http = new LinkedInHttpClient({ getCookies: currentCookies });
 const jobs = new LinkedInJobs(http, () => profileExcludes(loadProfile()));
 const watcher = new JobWatcher(jobs);
-const server = new McpServer({ name: 'linkedin-jobs', version: '0.2.0' });
+const server = new McpServer({ name: 'linkedin-jobs', version: '0.3.0' });
 
 const text = (value: unknown) => ({
   content: [{ type: 'text' as const, text: typeof value === 'string' ? value : JSON.stringify(value, null, 2) }],
@@ -153,7 +154,7 @@ server.tool(
   {
     seniority: z.enum(SENIORITY).optional().describe('intern | junior | mid | senior | lead. Drives which title words are dropped.'),
     yearsExperience: z.number().min(0).max(50).optional(),
-    skills: z.array(z.string().min(1).max(40)).max(40).optional().describe("e.g. ['React','TypeScript','Node.js','Python']"),
+    skills: z.array(z.string().min(1).max(40)).max(60).optional().describe("e.g. ['React','TypeScript','Node.js','Python']"),
     languages: z
       .record(z.string().regex(/^[a-z]{2}$/, 'ISO 639-1 code like en, de, nl, pt'), z.enum(LANG_LEVELS))
       .optional()
@@ -167,6 +168,56 @@ server.tool(
       const merged: Profile = { ...(loadProfile() ?? {}), ...Object.fromEntries(Object.entries(args).filter(([, v]) => v !== undefined)) };
       saveProfile(merged);
       return { saved: merged, droppedTitleWords: profileExcludes(merged) ?? [], file: profilePath };
+    }),
+);
+
+server.tool(
+  'import-profile',
+  "Fill your profile from the real thing instead of typing it. Without `text`: reads YOUR OWN LinkedIn profile (jobs with dates, skills, languages) through the saved login session; it can only read the account that owns the session. With `text`: parses a CV or LinkedIn 'Save to PDF' text you paste (works without login and does not depend on LinkedIn's internal API). Fills seniority, yearsExperience, skills and languages; never needsVisa (a profile cannot know it: use set-profile). Saves by default and returns what it understood, so fix anything wrong with set-profile.",
+  {
+    text: z.string().min(40).max(60000).optional().describe('CV or LinkedIn profile text. Omit to read your own LinkedIn profile through the session.'),
+    save: z.boolean().default(true).describe('false = only preview what would be saved'),
+    debug: z.boolean().optional().describe('Include per-step diagnostics (response entity types) of the LinkedIn read'),
+  },
+  ({ text, save, debug }) =>
+    run(async () => {
+      const d = new Date();
+      const now = { y: d.getFullYear(), m: d.getMonth() + 1 };
+      let imported;
+      let diagnostics;
+      if (text) imported = importFromText(text, now);
+      else {
+        currentCookies();
+        if (!http.hasSession()) throw new Error('Not logged in. Run login-with-browser, or pass `text` with your CV.');
+        const res = await fetchOwnProfile(http, now);
+        imported = res.imported;
+        diagnostics = res.diagnostics;
+      }
+      const found = imported.profile;
+      if (found.yearsExperience === undefined && !found.skills?.length && !Object.keys(found.languages ?? {}).length) {
+        return {
+          saved: false,
+          error: 'Nothing usable was found in the source. LinkedIn may have changed its internal API; pass `text` (CV or Save to PDF) instead.',
+          notes: imported.notes,
+          diagnostics,
+        };
+      }
+      const current = loadProfile() ?? {};
+      const merged: Profile = {
+        ...current,
+        ...Object.fromEntries(Object.entries(found).filter(([k, v]) => k !== 'languages' && v !== undefined)),
+        ...(found.languages ? { languages: { ...(current.languages ?? {}), ...found.languages } } : {}),
+      };
+      if (save) saveProfile(merged);
+      return {
+        saved: save,
+        imported: found,
+        positions: imported.positions,
+        notes: imported.notes,
+        needsVisa: merged.needsVisa ?? 'not set: use set-profile if you need sponsorship',
+        droppedTitleWords: profileExcludes(merged) ?? [],
+        ...(debug || !(found.yearsExperience !== undefined && found.skills?.length) ? { diagnostics } : {}),
+      };
     }),
 );
 
