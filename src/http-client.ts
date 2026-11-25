@@ -3,6 +3,8 @@
 // - redirects are followed by hand and checked hop by hop
 // - one request at a time, ~4 s apart with jitter
 // - on a rate limit or a security checkpoint: no retry, pause 15 min
+//   (the pause is saved to disk, so restarting the server does not lift it)
+import type { BlockInfo, RuntimeState } from './config.js';
 
 export class RateLimitError extends Error {
   constructor(message: string, public waitSeconds: number) {
@@ -36,6 +38,8 @@ export interface ClientOptions {
   fetchImpl?: typeof fetch;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
+  loadRuntime?: () => RuntimeState;
+  saveRuntime?: (r: RuntimeState) => void;
 }
 
 const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -51,6 +55,7 @@ export class LinkedInHttpClient {
   private lastRequestAt = 0;
   private cooldownUntil = 0;
   private cooldownReason = '';
+  lastBlock?: BlockInfo;
   requestCount = 0;
 
   constructor(private opts: ClientOptions) {
@@ -60,6 +65,16 @@ export class LinkedInHttpClient {
     this.fetchImpl = opts.fetchImpl ?? fetch;
     this.now = opts.now ?? Date.now;
     this.sleep = opts.sleep ?? defaultSleep;
+    try {
+      const saved = opts.loadRuntime?.();
+      if (saved) {
+        this.cooldownUntil = saved.cooldownUntil || 0;
+        this.cooldownReason = saved.cooldownReason || '';
+        this.lastBlock = saved.lastBlock;
+      }
+    } catch {
+      // No saved state: start clean.
+    }
   }
 
   cookieHeader(): string {
@@ -74,9 +89,15 @@ export class LinkedInHttpClient {
     return Math.max(0, Math.ceil((this.cooldownUntil - this.now()) / 1000));
   }
 
-  private startCooldown(reason: string): never {
+  private startCooldown(reason: string, url: URL, withSession: boolean): never {
     this.cooldownUntil = this.now() + this.cooldownMs;
     this.cooldownReason = reason;
+    this.lastBlock = { at: new Date(this.now()).toISOString(), reason, path: url.pathname, withSession };
+    try {
+      this.opts.saveRuntime?.({ cooldownUntil: this.cooldownUntil, cooldownReason: reason, lastBlock: this.lastBlock });
+    } catch {
+      // The in-memory pause still applies.
+    }
     throw new RateLimitError(
       `LinkedIn ${reason}. Paused for ${Math.round(this.cooldownMs / 60000)} min to protect your account; do not retry before that.`,
       Math.round(this.cooldownMs / 1000),
@@ -130,14 +151,14 @@ export class LinkedInHttpClient {
       if (cookies) headers.cookie = cookies;
       const res = await this.fetchImpl(url, { headers, redirect: 'manual', signal: AbortSignal.timeout(25000) });
 
-      if (res.status === 429 || res.status === 999) this.startCooldown(`rate limit (HTTP ${res.status})`);
+      if (res.status === 429 || res.status === 999) this.startCooldown(`rate limit (HTTP ${res.status})`, url, !!cookies);
 
       if (res.status >= 300 && res.status < 400) {
         const location = res.headers.get('location');
         if (!location) throw new Error(`Redirect without location from ${url.pathname}`);
         const next = new URL(location, url);
         if (!isLinkedInUrl(next)) throw new BlockedUrlError(`LinkedIn redirected off linkedin.com (${next.origin}); stopped.`);
-        if (SECURITY_BLOCKERS.some((p) => next.pathname.startsWith(p))) this.startCooldown('security checkpoint');
+        if (SECURITY_BLOCKERS.some((p) => next.pathname.startsWith(p))) this.startCooldown('security checkpoint', next, !!cookies);
         if (AUTH_BLOCKERS.some((p) => next.pathname.startsWith(p))) {
           throw new SessionExpiredError(
             cookies

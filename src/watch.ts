@@ -6,6 +6,8 @@ export type FreshJob = JobCard & { isNew: boolean; matchedKeywords: string };
 
 const MIN_WINDOW_MIN = 15;
 const MAX_WINDOW_MIN = 7 * 24 * 60;
+// check-saved-searches skips a search checked less than this long ago (unless forced).
+export const MIN_RECHECK_MIN = 10;
 
 export class JobWatcher {
   constructor(
@@ -27,6 +29,7 @@ export class JobWatcher {
     const errors: string[] = [];
     const warnings = new Set<string>();
     let excludedByTitle = 0;
+    let requests = 0;
 
     for (const kw of opts.keywords) {
       try {
@@ -36,7 +39,10 @@ export class JobWatcher {
           postedWithinMinutes: opts.withinMinutes,
           sortBy: 'date',
           maxPages: opts.maxPages ?? 2,
+          // Only worth stopping early when the caller hides seen jobs anyway.
+          ...(opts.onlyNew ? { stopWhenAllKnown: (id: string) => !!state.seen[id] } : {}),
         });
+        requests += res.requests;
         res.warnings?.forEach((w) => warnings.add(`${kw}: ${w}`));
         excludedByTitle += res.excludedByTitle ?? 0;
         for (const job of res.jobs) {
@@ -58,6 +64,7 @@ export class JobWatcher {
     return {
       withinMinutes: opts.withinMinutes,
       total: list.length,
+      requests,
       newCount: list.filter((j) => j.isNew).length,
       ...(excludedByTitle ? { excludedByTitle } : {}),
       ...(warnings.size ? { warnings: [...warnings] } : {}),
@@ -92,14 +99,21 @@ export class JobWatcher {
   }
 
   /** Runs saved searches over the time since each was last checked and returns only jobs never seen before. */
-  async checkSaved(names?: string[]) {
+  async checkSaved(names?: string[], force = false) {
     const state = this.load();
     const wanted = names?.length ? new Set(names.map((n) => n.toLowerCase())) : null;
     const targets = state.savedSearches.filter((s) => !wanted || wanted.has(s.name.toLowerCase()));
     if (!targets.length) return { results: [], note: 'No saved searches. Use save-search first.' };
 
     const results = [];
+    const skipped: string[] = [];
+    let requests = 0;
     for (const s of targets) {
+      const sinceChecked = s.lastCheckedAt ? (this.now() - Date.parse(s.lastCheckedAt)) / 60000 : Infinity;
+      if (!force && sinceChecked < MIN_RECHECK_MIN) {
+        skipped.push(`${s.name} (checked ${Math.round(sinceChecked)} min ago)`);
+        continue;
+      }
       const since = s.lastCheckedAt ? (this.now() - Date.parse(s.lastCheckedAt)) / 60000 : 24 * 60;
       const withinMinutes = Math.round(Math.min(MAX_WINDOW_MIN, Math.max(MIN_WINDOW_MIN, since + 5)));
       const res = await this.fresh({
@@ -115,12 +129,18 @@ export class JobWatcher {
         onlyNew: true,
         maxPages: 3,
       });
+      requests += res.requests;
       const latest = this.load();
       const idx = latest.savedSearches.findIndex((x) => x.name === s.name);
       if (idx >= 0) latest.savedSearches[idx].lastCheckedAt = new Date(this.now()).toISOString();
       this.save(latest);
       results.push({ search: s.name, windowMinutes: withinMinutes, newJobs: res.jobs, ...(res.errors ? { errors: res.errors } : {}) });
     }
-    return { totalNew: results.reduce((n, r) => n + r.newJobs.length, 0), results };
+    return {
+      totalNew: results.reduce((n, r) => n + r.newJobs.length, 0),
+      requests,
+      ...(skipped.length ? { skipped, note: `Searches checked under ${MIN_RECHECK_MIN} min ago were skipped; pass force: true to run them anyway.` } : {}),
+      results,
+    };
   }
 }

@@ -34,3 +34,19 @@ Servidor só de leitura: nenhuma ferramenta candidata, manda mensagem, conecta o
 - O `npm run login` não foi rodado (exige o seu navegador e a sua conta).
 
 Busca, detalhe público, `fresh-jobs` e a marcação de vaga vista foram testados contra o LinkedIn real em 16/11/2026.
+
+## Economia de requisições (0.5.0)
+
+O throttle só espaça as requisições. Estas mudanças cortam requisições que não precisavam acontecer:
+
+| Onde | Antes | Agora |
+|---|---|---|
+| `search-jobs` / `fresh-jobs` | pedia todas as `maxPages`, mesmo depois de uma página curta | para na primeira página com menos de 10 vagas; com `onlyNew`, para também na primeira página só com vagas já vistas |
+| Busca repetida | refazia tudo | resultado da mesma URL vem do cache por 5 min |
+| `get-job-details` | 1 pública + 1 logada a cada chamada | pública em cache por 6 h, extras logados por 1 h (em disco: `cache-jobs.json`, `cache-extras.json`); `refresh: true` ignora o cache |
+| `triage-jobs` | 2 requisições por vaga (pública + logada) | 1 por vaga não cacheada: a classificação não usa os extras logados |
+| Extras logados quebrados | 1 requisição perdida por vaga | depois da primeira falha, pula por 1 h |
+| `check-saved-searches` | rodava de novo mesmo checada 1 min antes | pula busca checada há menos de 10 min (`force: true` roda mesmo assim) |
+| Pausa de 15 min | só em memória: reiniciar o servidor liberava | salva em `runtime.json`; o servidor reiniciado continua respeitando |
+
+`session-status` agora mostra o `lastBlock` (endpoint e se a requisição levava a sua sessão). `withSession: false` significa que o LinkedIn barrou o endpoint público pelo IP, não a sua conta. As ferramentas devolvem `requests` pra mostrar quantas requisições de fato foram feitas.

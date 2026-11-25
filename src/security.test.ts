@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { LinkedInHttpClient, RateLimitError, SessionExpiredError, BlockedUrlError } from './http-client.js';
 import { assertJobId, buildSearchQuery, parseAgo, visaSignals, LinkedInJobs, normalizeKeywords, titleExcluded } from './linkedin.js';
 import { JobWatcher } from './watch.js';
-import type { WatchState } from './config.js';
+import type { RuntimeState, WatchState } from './config.js';
 
 const SESSION = 'li_at=SECRET; JSESSIONID="ajax:1"';
 type Call = { url: string; headers: Record<string, string> };
@@ -92,8 +92,9 @@ test('fresh-jobs flags new vs seen and check-saved only returns unseen', async (
   const card = (id: string, ago: string) => `<li><div data-entity-urn="urn:li:jobPosting:${id}"><h3 class="base-search-card__title">Dev ${id}</h3><time datetime="2026-11-16">${ago}</time></div></li>`;
   let state: WatchState = { savedSearches: [], seen: {} };
   const { client } = mockClient([
-    { status: 200, body: card('1000001', '5 minutes ago') + card('1000002', '1 hour ago') }, { status: 200, body: '' },
-    { status: 200, body: card('1000002', '1 hour ago') + card('1000003', '2 minutes ago') }, { status: 200, body: '' },
+    // Short pages (< 10 cards) are the last page, so no empty page 2 is requested.
+    { status: 200, body: card('1000001', '5 minutes ago') + card('1000002', '1 hour ago') },
+    { status: 200, body: card('1000002', '1 hour ago') + card('1000003', '2 minutes ago') },
   ]);
   const w = new JobWatcher(new LinkedInJobs(client), () => structuredClone(state), (s) => (state = structuredClone(s)), () => Date.parse('2026-11-16T06:00:00Z'));
   const first = await w.fresh({ keywords: ['dev'], withinMinutes: 60 });
@@ -127,4 +128,77 @@ test('titleExcluded matches whole words only', () => {
   assert.equal(titleExcluded('Full Stack Engineer', ['senior', 'lead']), false);
   assert.equal(titleExcluded('Leading Edge Full Stack Developer', ['lead']), false);
   assert.equal(titleExcluded('Internal Tools Developer', ['intern']), false);
+});
+
+// ── Request savings ───────────────────────────────────────────────────────────
+
+const cards = (from: number, n: number) =>
+  Array.from({ length: n }, (_, i) => `<li><div data-entity-urn="urn:li:jobPosting:${from + i}"><h3 class="base-search-card__title">Dev ${from + i}</h3><time>1 hour ago</time></div></li>`).join('');
+
+test('search stops paging on a short page', async () => {
+  const { client, calls } = mockClient([{ status: 200, body: cards(2000000, 4) }]);
+  const r = await new LinkedInJobs(client).search({ keywords: 'react', maxPages: 5 });
+  assert.equal(calls.length, 1);
+  assert.equal(r.returned, 4);
+  assert.equal(r.stoppedEarly, 'last page');
+});
+
+test('search stops paging when a full page is all already-seen jobs', async () => {
+  const { client, calls } = mockClient([{ status: 200, body: cards(3000000, 10) }, { status: 200, body: cards(3000010, 10) }]);
+  const r = await new LinkedInJobs(client).search({ keywords: 'react', maxPages: 5, stopWhenAllKnown: () => true });
+  assert.equal(calls.length, 1);
+  assert.equal(r.requests, 1);
+});
+
+test('repeating a search within the TTL makes no new request', async () => {
+  const { client, calls } = mockClient([{ status: 200, body: cards(4000000, 3) }]);
+  const jobs = new LinkedInJobs(client);
+  await jobs.search({ keywords: 'react' });
+  const again = await jobs.search({ keywords: 'react' });
+  assert.equal(calls.length, 1);
+  assert.equal(again.requests, 0);
+  assert.equal(again.returned, 3);
+});
+
+test('job details are cached and triage-style calls skip the logged-in extras', async () => {
+  const html = '<h2 class="top-card-layout__title">Dev</h2><div class="show-more-less-html__markup">React</div>';
+  const { client, calls } = mockClient([{ status: 200, body: html }]);
+  const jobs = new LinkedInJobs(client);
+  await jobs.details('4489680030', { extras: false });
+  const cached = await jobs.details('4489680030', { extras: false });
+  assert.equal(calls.length, 1);
+  assert.ok(!calls.some((c) => c.url.includes('/voyager/')));
+  assert.ok(cached.cachedAt);
+});
+
+test('check-saved skips searches checked minutes ago unless forced', async () => {
+  let state: WatchState = { savedSearches: [{ name: 'dev', keywords: 'dev', createdAt: '2026-11-16T05:00:00Z', lastCheckedAt: '2026-11-16T05:58:00Z' }], seen: {} };
+  const { client, calls } = mockClient([{ status: 200, body: cards(5000000, 2) }]);
+  const w = new JobWatcher(new LinkedInJobs(client), () => structuredClone(state), (s) => (state = structuredClone(s)), () => Date.parse('2026-11-16T06:00:00Z'));
+  const skipped = await w.checkSaved();
+  assert.equal(calls.length, 0);
+  assert.equal('skipped' in skipped ? skipped.skipped?.length : 0, 1);
+  const forced = await w.checkSaved(undefined, true);
+  assert.equal(calls.length, 1);
+  assert.equal('totalNew' in forced ? forced.totalNew : 0, 2);
+});
+
+test('the rate-limit pause survives a restart and records who was blocked', async () => {
+  let saved: RuntimeState | undefined;
+  const blocked = new LinkedInHttpClient({
+    getCookies: () => SESSION, minIntervalMs: 0, sleep: async () => {},
+    fetchImpl: (async () => ({ status: 429, headers: new Headers(), text: async () => '' })) as unknown as typeof fetch,
+    saveRuntime: (r) => (saved = r),
+  });
+  await assert.rejects(blocked.get('https://www.linkedin.com/jobs-guest/jobs/api/x', { useSession: false }), RateLimitError);
+  assert.equal(saved?.lastBlock?.withSession, false);
+  assert.equal(saved?.lastBlock?.path, '/jobs-guest/jobs/api/x');
+  let calls = 0;
+  const restarted = new LinkedInHttpClient({
+    getCookies: () => SESSION, minIntervalMs: 0, sleep: async () => {},
+    fetchImpl: (async () => (calls++, new Response('ok'))) as unknown as typeof fetch,
+    loadRuntime: () => saved!,
+  });
+  await assert.rejects(restarted.get('https://www.linkedin.com/jobs/y'), /Paused/);
+  assert.equal(calls, 0);
 });

@@ -1,7 +1,10 @@
 import * as cheerio from 'cheerio';
 import { LinkedInHttpClient } from './http-client.js';
+import { TtlCache } from './cache.js';
 
 const GUEST = 'https://www.linkedin.com/jobs-guest/jobs/api';
+// The guest search endpoint returns 10 cards per page; fewer means it was the last page.
+export const GUEST_PAGE_SIZE = 10;
 
 // Filter maps copied from linkedin-mcp-server (application/search_jobs.py).
 export const DATE_POSTED = { past_hour: 3600, past_24_hours: 86400, past_week: 604800, past_month: 2592000 } as const;
@@ -36,6 +39,9 @@ export interface SearchParams {
   excludeTitle?: string[]; // drop cards whose title contains any of these words (backs up NOT)
   sortBy?: keyof typeof SORT;
   maxPages?: number;
+  // Stop paging once a whole page is made of jobs this returns true for
+  // (results sorted by date: older pages would be known too).
+  stopWhenAllKnown?: (id: string) => boolean;
 }
 
 /**
@@ -194,12 +200,38 @@ export function parseJobHtml(id: string, html: string) {
   };
 }
 
+export type JobDetails = ReturnType<typeof parseJobHtml>;
+type Extras = Record<string, unknown>;
+
+export interface JobsCaches {
+  // Parsed search pages, keyed by URL. Short TTL: listings move fast.
+  search?: TtlCache<JobCard[]>;
+  // Parsed public posting. Descriptions rarely change; applicants/closed may lag by the TTL.
+  details?: TtlCache<JobDetails>;
+  // Logged-in extras (applicant count, applied flag). Shorter TTL.
+  extras?: TtlCache<Extras>;
+}
+
+export const SEARCH_TTL_MS = 5 * 60 * 1000;
+export const DETAILS_TTL_MS = 6 * 60 * 60 * 1000;
+export const EXTRAS_TTL_MS = 60 * 60 * 1000;
+
 export class LinkedInJobs {
+  readonly caches: Required<JobsCaches>;
+  private extrasOffUntil = 0;
+
   constructor(
     private http: LinkedInHttpClient,
     // Title words to drop when a call does not pass excludeTitle (from the user's profile).
     private defaultExclude: () => string[] | undefined = () => undefined,
-  ) {}
+    caches: JobsCaches = {},
+  ) {
+    this.caches = {
+      search: caches.search ?? new TtlCache<JobCard[]>(SEARCH_TTL_MS, 200),
+      details: caches.details ?? new TtlCache<JobDetails>(DETAILS_TTL_MS, 300),
+      extras: caches.extras ?? new TtlCache<Extras>(EXTRAS_TTL_MS, 300),
+    };
+  }
 
   async search(p: SearchParams) {
     const maxPages = Math.max(1, Math.min(p.maxPages ?? 1, 10));
@@ -208,11 +240,19 @@ export class LinkedInJobs {
     const { warnings } = normalizeKeywords(p.keywords);
     const exclude = p.excludeTitle ?? this.defaultExclude();
     let excludedByTitle = 0;
+    let requests = 0;
     let start = 0;
+    let stoppedEarly: string | undefined;
     for (let page = 0; page < maxPages; page++) {
       // Public endpoints: no cookies, so scraping is never tied to your account.
-      const res = await this.http.get(`${GUEST}/seeMoreJobPostings/search?${buildSearchQuery(p, start)}`, { useSession: false });
-      const cards = parseSearchHtml(res.text);
+      const url = `${GUEST}/seeMoreJobPostings/search?${buildSearchQuery(p, start)}`;
+      let cards = this.caches.search.get(url)?.value;
+      if (!cards) {
+        const res = await this.http.get(url, { useSession: false });
+        requests++;
+        cards = parseSearchHtml(res.text);
+        this.caches.search.set(url, cards);
+      }
       if (!cards.length) break;
       for (const c of cards) {
         if (seen.has(c.id)) continue;
@@ -221,30 +261,57 @@ export class LinkedInJobs {
         else jobs.push(c);
       }
       start += cards.length;
+      if (page + 1 >= maxPages) break;
+      if (cards.length < GUEST_PAGE_SIZE) {
+        stoppedEarly = 'last page';
+        break;
+      }
+      if (p.stopWhenAllKnown && cards.every((c) => p.stopWhenAllKnown!(c.id))) {
+        stoppedEarly = 'only already-seen jobs on this page';
+        break;
+      }
     }
     return {
       query: Object.fromEntries(buildSearchQuery(p)),
       ...(warnings.length ? { warnings } : {}),
       returned: jobs.length,
       ...(excludedByTitle ? { excludedByTitle } : {}),
+      requests,
+      ...(stoppedEarly ? { stoppedEarly } : {}),
       nextStart: start,
       jobs,
     };
   }
 
-  async details(rawId: string) {
+  /**
+   * One public request per job (cached for hours), plus one logged-in request
+   * for the extras only when `extras` is true and a session exists.
+   */
+  async details(rawId: string, { extras = true, refresh = false }: { extras?: boolean; refresh?: boolean } = {}) {
     const id = assertJobId(rawId);
-    const res = await this.http.get(`${GUEST}/jobPosting/${id}`, { useSession: false });
-    if (res.status === 404 || !res.text) throw new Error(`Job ${id} not found (it may have been removed).`);
-    const job = parseJobHtml(id, res.text);
-    const extra = this.http.hasSession() ? await this.sessionExtras(id) : undefined;
-    return { ...job, ...(extra ? { session: extra } : {}) };
+    const hit = refresh ? undefined : this.caches.details.get(id);
+    let job: JobDetails;
+    let cachedAt: string | undefined;
+    if (hit) {
+      job = hit.value;
+      cachedAt = new Date(hit.at).toISOString();
+    } else {
+      const res = await this.http.get(`${GUEST}/jobPosting/${id}`, { useSession: false });
+      if (res.status === 404 || !res.text) throw new Error(`Job ${id} not found (it may have been removed).`);
+      job = parseJobHtml(id, res.text);
+      this.caches.details.set(id, job);
+    }
+    const extra = extras && this.http.hasSession() ? await this.sessionExtras(id, refresh) : undefined;
+    return { ...job, ...(cachedAt ? { cachedAt } : {}), ...(extra ? { session: extra } : {}) };
   }
 
   // Logged-in extras (exact publish time, applicant count, easy apply, whether
   // you already applied). Uses LinkedIn's internal web API with your session.
   // Not verified against a live account yet: any failure just drops the extras.
-  private async sessionExtras(id: string) {
+  private async sessionExtras(id: string, refresh = false): Promise<Extras> {
+    const hit = refresh ? undefined : this.caches.extras.get(id);
+    if (hit) return { ...hit.value, cachedAt: new Date(hit.at).toISOString() };
+    if (Date.now() < this.extrasOffUntil) return { note: 'Logged-in extras skipped: they failed recently, retrying in under 1 h.' };
     try {
       const jsession = /JSESSIONID="?([^";]+)"?/.exec(this.cookies())?.[1];
       if (!jsession) return { note: 'Session has no JSESSIONID cookie; run login-with-browser again for logged-in extras.' };
@@ -253,7 +320,7 @@ export class LinkedInJobs {
         { 'csrf-token': jsession, 'x-restli-protocol-version': '2.0.0', accept: 'application/json' },
       );
       const d = JSON.parse(res.text)?.data ?? JSON.parse(res.text);
-      return {
+      const extras: Extras = {
         listedAt: d.listedAt ? new Date(d.listedAt).toISOString() : undefined,
         minutesSinceListed: d.listedAt ? Math.round((Date.now() - d.listedAt) / 60000) : undefined,
         applies: d.applies,
@@ -262,8 +329,12 @@ export class LinkedInJobs {
         alreadyApplied: d.applyingInfo?.applied ?? undefined,
         remoteAllowed: d.workRemoteAllowed,
       };
+      this.caches.extras.set(id, extras);
+      return extras;
     } catch (error) {
       if (error instanceof Error && /Paused|rate limit|checkpoint|expired/i.test(error.message)) throw error;
+      // Broken endpoint or changed API: stop spending a request per job on it for a while.
+      this.extrasOffUntil = Date.now() + 60 * 60 * 1000;
       return { note: `Logged-in extras unavailable: ${error instanceof Error ? error.message : String(error)}` };
     }
   }

@@ -6,6 +6,9 @@ import * as path from 'path';
 export const configDir = process.env.LINKEDIN_JOBS_MCP_DIR || path.join(os.homedir(), '.linkedin-jobs-mcp');
 export const configPath = path.join(configDir, 'config.json');
 export const statePath = path.join(configDir, 'state.json');
+export const runtimePath = path.join(configDir, 'runtime.json');
+export const jobCachePath = path.join(configDir, 'cache-jobs.json');
+export const extrasCachePath = path.join(configDir, 'cache-extras.json');
 
 export interface SessionConfig {
   cookies: string; // Cookie header for .linkedin.com, written by `npm run login`
@@ -74,6 +77,29 @@ export function saveState(state: WatchState): void {
     state.seen = Object.fromEntries(keep.map((id) => [id, state.seen[id]]));
   }
   writeJson(statePath, state);
+}
+
+// Rate-limit pause and the last block, saved so a restarted server keeps
+// respecting the pause instead of hitting LinkedIn again right away.
+export interface BlockInfo {
+  at: string;
+  reason: string;
+  path: string;
+  withSession: boolean;
+}
+export interface RuntimeState {
+  cooldownUntil: number;
+  cooldownReason: string;
+  lastBlock?: BlockInfo;
+}
+export const loadRuntime = () => readJson<RuntimeState>(runtimePath, { cooldownUntil: 0, cooldownReason: '' });
+export const saveRuntime = (r: RuntimeState) => writeJson(runtimePath, r);
+
+export function jsonFileStore<T>(file: string) {
+  return {
+    load: () => readJson<Record<string, { at: number; value: T }>>(file, {}),
+    save: (data: Record<string, { at: number; value: T }>) => writeJson(file, data),
+  };
 }
 
 export function configMtimeMs(): number {

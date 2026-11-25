@@ -5,9 +5,10 @@ import { spawn } from 'child_process';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { z } from 'zod';
-import { clearSession, configMtimeMs, configPath, loadSession, type SessionConfig } from './config.js';
+import { clearSession, configMtimeMs, configPath, extrasCachePath, jobCachePath, jsonFileStore, loadRuntime, loadSession, saveRuntime, type SessionConfig } from './config.js';
+import { TtlCache } from './cache.js';
 import { LinkedInHttpClient } from './http-client.js';
-import { DATE_POSTED, EXPERIENCE, JOB_TYPE, LinkedInJobs, SORT, WORK_TYPE } from './linkedin.js';
+import { DATE_POSTED, DETAILS_TTL_MS, EXPERIENCE, EXTRAS_TTL_MS, JOB_TYPE, LinkedInJobs, SORT, WORK_TYPE, type JobDetails } from './linkedin.js';
 import { JobWatcher } from './watch.js';
 import { fetchOwnProfile, importFromText } from './profile-import.js';
 import { COMPANY_SECTIONS, PERSON_SECTIONS, companyFrom, fetchCompany, fetchPerson, usernameFrom } from './person.js';
@@ -36,10 +37,14 @@ function currentCookies(): string {
   return session.cookies;
 }
 
-const http = new LinkedInHttpClient({ getCookies: currentCookies });
-const jobs = new LinkedInJobs(http, () => profileExcludes(loadProfile()));
+const http = new LinkedInHttpClient({ getCookies: currentCookies, loadRuntime, saveRuntime });
+// Job details and logged-in extras are cached on disk, so a restart does not refetch them.
+const jobs = new LinkedInJobs(http, () => profileExcludes(loadProfile()), {
+  details: new TtlCache<JobDetails>(DETAILS_TTL_MS, 300, Date.now, jsonFileStore<JobDetails>(jobCachePath)),
+  extras: new TtlCache<Record<string, unknown>>(EXTRAS_TTL_MS, 300, Date.now, jsonFileStore<Record<string, unknown>>(extrasCachePath)),
+});
 const watcher = new JobWatcher(jobs);
-const server = new McpServer({ name: 'linkedin-jobs', version: '0.4.0' });
+const server = new McpServer({ name: 'linkedin-jobs', version: '0.5.0' });
 
 const text = (value: unknown) => ({
   content: [{ type: 'text' as const, text: typeof value === 'string' ? value : JSON.stringify(value, null, 2) }],
@@ -98,7 +103,7 @@ server.tool(
     }),
 );
 
-server.tool('session-status', 'Show whether a LinkedIn session is saved, and any active rate-limit pause.', {}, () =>
+server.tool('session-status', 'Show whether a LinkedIn session is saved, any active rate-limit pause, the last block (which endpoint, with or without your session) and cache usage. Makes no request.', {}, () =>
   run(() => {
     currentCookies();
     return {
@@ -106,7 +111,14 @@ server.tool('session-status', 'Show whether a LinkedIn session is saved, and any
       user: session.userName || undefined,
       savedAt: session.savedAt || undefined,
       pausedForSeconds: http.cooldownRemainingSeconds(),
+      // withSession=false means LinkedIn blocked the public endpoint by IP, not your account.
+      lastBlock: http.lastBlock,
       requestsThisRun: http.requestCount,
+      cache: {
+        searchPages: jobs.caches.search.stats(),
+        jobDetails: jobs.caches.details.stats(),
+        loggedInExtras: jobs.caches.extras.stats(),
+      },
     };
   }),
 );
@@ -130,18 +142,21 @@ server.tool(
     ...filters,
     datePosted: z.enum(Object.keys(DATE_POSTED) as [keyof typeof DATE_POSTED]).optional(),
     sortBy: z.enum(Object.keys(SORT) as [keyof typeof SORT]).optional(),
-    maxPages: z.number().int().min(1).max(10).optional().describe('Pages of ~10 results (default 1). Each page is one request, ~4 s apart.'),
+    maxPages: z.number().int().min(1).max(10).optional().describe('Pages of ~10 results (default 1). Each page is one request, ~4 s apart; paging stops early on a short page, and repeats within 5 min come from cache.'),
   },
   (args) => run(() => jobs.search(args)),
 );
 
 server.tool(
   'get-job-details',
-  'Full posting: description, criteria, applicants, visaMentions (visa/relocation phrases in the ad; empty = not stated) and visaNegatives. When logged in, adds exact publish time, applicant count and whether you already applied.',
-  { jobId: z.string().regex(/^\d{6,15}$/, 'Numeric LinkedIn job id').describe('Job id from search-jobs or fresh-jobs') },
-  ({ jobId }) =>
+  'Full posting: description, criteria, applicants, visaMentions (visa/relocation phrases in the ad; empty = not stated) and visaNegatives. When logged in, adds exact publish time, applicant count and whether you already applied. Cached: the posting for 6 h, the logged-in extras for 1 h (see cachedAt).',
+  {
+    jobId: z.string().regex(/^\d{6,15}$/, 'Numeric LinkedIn job id').describe('Job id from search-jobs or fresh-jobs'),
+    refresh: z.boolean().optional().describe('Ignore the cache and fetch again (costs requests)'),
+  },
+  ({ jobId, refresh }) =>
     run(async () => {
-      const job = await jobs.details(jobId);
+      const job = await jobs.details(jobId, { refresh });
       const profile = loadProfile();
       return profile ? { ...job, fit: analyzeFit(job, profile) } : job;
     }),
@@ -266,7 +281,7 @@ server.tool('clear-profile', 'Delete the saved profile.', {}, () => run(() => (c
 
 server.tool(
   'triage-jobs',
-  'Open several postings and rank them against your profile: good, stretch, unknown, blocked, with the reasons (years asked, languages, visa, stack overlap). Use it on ids from search-jobs or fresh-jobs before reading descriptions one by one.',
+  'Open several postings and rank them against your profile: good, stretch, unknown, blocked, with the reasons (years asked, languages, visa, stack overlap). Use it on ids from search-jobs or fresh-jobs before reading descriptions one by one. One public request per job not already cached; it skips the logged-in extras, which the ranking does not use.',
   { jobIds: z.array(z.string().regex(/^\d{6,15}$/)).min(1).max(10) },
   ({ jobIds }) =>
     run(async () => {
@@ -277,7 +292,7 @@ server.tool(
       const errors: string[] = [];
       for (const id of [...new Set(jobIds)]) {
         try {
-          const job = await jobs.details(id);
+          const job = await jobs.details(id, { extras: false });
           const fit = analyzeFit(job, profile);
           rows.push({
             id,
@@ -332,9 +347,12 @@ server.tool('delete-saved-search', 'Delete a saved search by name.', { name: z.s
 
 server.tool(
   'check-saved-searches',
-  'Run saved searches over the time since each was last checked and return only jobs never seen before.',
-  { names: z.array(z.string().max(60)).max(30).optional().describe('Subset by name; default all') },
-  ({ names }) => run(() => watcher.checkSaved(names)),
+  'Run saved searches over the time since each was last checked and return only jobs never seen before. Searches checked under 10 min ago are skipped, and paging stops at the first page with nothing new.',
+  {
+    names: z.array(z.string().max(60)).max(30).optional().describe('Subset by name; default all'),
+    force: z.boolean().optional().describe('Run even searches checked under 10 min ago'),
+  },
+  ({ names, force }) => run(() => watcher.checkSaved(names, force)),
 );
 
 await server.connect(new StdioServerTransport());
