@@ -57,3 +57,10 @@ Achados ao ler o `session-status` depois do primeiro uso real:
 
 - **Redirecionamento em loop com o cookie:** o `get-job-details` logado deu "Too many redirects". Antes, cada salto era uma requisição de verdade e só a primeira passava pelo throttle: um loop disparava até 6 requisições seguidas, sem espaço, levando o cookie. Agora cada salto passa pelo throttle e o primeiro URL repetido para tudo, com o caminho percorrido (só caminhos, nunca cookie) na mensagem de erro.
 - **Extras logados agora são opt-in** (`LINKEDIN_EXTRAS=1`). Eles chamam a API interna do LinkedIn com o seu cookie, nunca foram verificados ao vivo e falharam nas 5 vezes em que rodaram. É a requisição de maior risco pra conta, e o que ela entrega (contagem de candidatos, "já me candidatei") não vale isso.
+
+## Ajustes 0.5.2 (26/11/2026)
+
+O `session-status` depois da 0.5.1 mostrou o 429 de novo, na 7ª requisição da rodada, apenas ~13 min depois do fim da pausa anterior. O limite do endpoint público é mais baixo e mais pegajoso do que 15 min de pausa resolvem.
+
+- **Pausa escalonada:** um bloqueio menos de 90 min depois do anterior dobra a pausa (15, 30, 60 min, no máximo 2 h). Calado por 90 min volta pra 15. O contador (`blocksInARow` no `session-status`) fica salvo em disco junto com a pausa.
+- **`triage-jobs` não perde mais o trabalho:** antes, um 429 no meio jogava fora tudo e devolvia só o erro. Agora devolve o que já classificou, os IDs `pending` e o tempo de pausa. As vagas já abertas ficam no cache, então a segunda chamada só gasta requisição com o que faltou, e as que já estão no cache vão primeiro.

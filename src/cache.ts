@@ -38,6 +38,12 @@ export class TtlCache<T> {
     return e;
   }
 
+  /** Like get, but does not count as a hit or a miss. */
+  peek(key: string): { value: T; at: number } | undefined {
+    const e = this.map.get(key);
+    return e && this.now() - e.at <= this.ttlMs ? e : undefined;
+  }
+
   set(key: string, value: T): void {
     this.map.delete(key);
     this.map.set(key, { at: this.now(), value });

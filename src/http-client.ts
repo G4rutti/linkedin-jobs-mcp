@@ -42,6 +42,8 @@ export interface ClientOptions {
   saveRuntime?: (r: RuntimeState) => void;
 }
 
+const STRIKE_WINDOW_MS = 90 * 60 * 1000;
+const MAX_COOLDOWN_MS = 2 * 60 * 60 * 1000;
 const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 export class LinkedInHttpClient {
@@ -56,6 +58,7 @@ export class LinkedInHttpClient {
   private cooldownUntil = 0;
   private cooldownReason = '';
   lastBlock?: BlockInfo;
+  strikes = 0;
   requestCount = 0;
 
   constructor(private opts: ClientOptions) {
@@ -71,6 +74,7 @@ export class LinkedInHttpClient {
         this.cooldownUntil = saved.cooldownUntil || 0;
         this.cooldownReason = saved.cooldownReason || '';
         this.lastBlock = saved.lastBlock;
+        this.strikes = saved.strikes ?? 0;
       }
     } catch {
       // No saved state: start clean.
@@ -90,17 +94,23 @@ export class LinkedInHttpClient {
   }
 
   private startCooldown(reason: string, url: URL, withSession: boolean): never {
-    this.cooldownUntil = this.now() + this.cooldownMs;
+    // Real use showed LinkedIn blocking again within minutes of a 15 min pause ended,
+    // so a block soon after the previous one doubles the pause (15, 30, 60, then 2 h).
+    const previousAt = this.lastBlock ? Date.parse(this.lastBlock.at) : NaN;
+    const repeated = Number.isFinite(previousAt) && this.now() - previousAt < STRIKE_WINDOW_MS;
+    this.strikes = repeated ? this.strikes + 1 : 1;
+    const pauseMs = Math.min(this.cooldownMs * 2 ** (this.strikes - 1), MAX_COOLDOWN_MS);
+    this.cooldownUntil = this.now() + pauseMs;
     this.cooldownReason = reason;
     this.lastBlock = { at: new Date(this.now()).toISOString(), reason, path: url.pathname, withSession };
     try {
-      this.opts.saveRuntime?.({ cooldownUntil: this.cooldownUntil, cooldownReason: reason, lastBlock: this.lastBlock });
+      this.opts.saveRuntime?.({ cooldownUntil: this.cooldownUntil, cooldownReason: reason, lastBlock: this.lastBlock, strikes: this.strikes });
     } catch {
       // The in-memory pause still applies.
     }
     throw new RateLimitError(
-      `LinkedIn ${reason}. Paused for ${Math.round(this.cooldownMs / 60000)} min to protect your account; do not retry before that.`,
-      Math.round(this.cooldownMs / 1000),
+      `LinkedIn ${reason}. Paused for ${Math.round(pauseMs / 60000)} min to protect your account${this.strikes > 1 ? ` (block ${this.strikes} in a row, so the pause grows)` : ''}; do not retry before that.`,
+      Math.round(pauseMs / 1000),
     );
   }
 

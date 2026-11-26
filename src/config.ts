@@ -91,6 +91,8 @@ export interface RuntimeState {
   cooldownUntil: number;
   cooldownReason: string;
   lastBlock?: BlockInfo;
+  // Blocks in a row (a new block less than 90 min after the previous one counts as another).
+  strikes?: number;
 }
 export const loadRuntime = () => readJson<RuntimeState>(runtimePath, { cooldownUntil: 0, cooldownReason: '' });
 export const saveRuntime = (r: RuntimeState) => writeJson(runtimePath, r);

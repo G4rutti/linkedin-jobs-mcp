@@ -286,6 +286,14 @@ export class LinkedInJobs {
     };
   }
 
+  hasDetails(rawId: string): boolean {
+    try {
+      return !!this.caches.details.peek(assertJobId(rawId));
+    } catch {
+      return false;
+    }
+  }
+
   /**
    * One public request per job (cached for hours), plus one logged-in request
    * for the extras only when `extras` is true and a session exists.

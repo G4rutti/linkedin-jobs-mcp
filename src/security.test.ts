@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { LinkedInHttpClient, RateLimitError, SessionExpiredError, BlockedUrlError } from './http-client.js';
 import { assertJobId, buildSearchQuery, parseAgo, visaSignals, LinkedInJobs, normalizeKeywords, titleExcluded } from './linkedin.js';
 import { JobWatcher } from './watch.js';
+import { triageJobs } from './triage.js';
 import type { RuntimeState, WatchState } from './config.js';
 
 const SESSION = 'li_at=SECRET; JSESSIONID="ajax:1"';
@@ -232,4 +233,47 @@ test('logged-in extras are off by default, even with a session', async () => {
   await new LinkedInJobs(client).details('5489680030');
   assert.equal(calls.length, 1);
   assert.ok(!calls.some((c) => c.url.includes('/voyager/')));
+});
+
+const posting = (title: string) => `<h2 class="top-card-layout__title">${title}</h2><div class="show-more-less-html__markup">React and Node.js</div>`;
+
+test('triage keeps what it ranked and lists the rest as pending when LinkedIn rate-limits', async () => {
+  const { client, calls } = mockClient([{ status: 200, body: posting('Full Stack Dev') }, { status: 429 }, { status: 200, body: posting('never reached') }]);
+  const r = await triageJobs(new LinkedInJobs(client), { skills: ['React'] }, ['6000001', '6000002', '6000003']);
+  assert.equal(r.ranked.length, 1);
+  assert.equal(r.ranked[0].id, '6000001');
+  assert.deepEqual(r.pending, ['6000002', '6000003']);
+  assert.ok(r.rateLimit && r.rateLimit.pausedForSeconds > 0);
+  assert.equal(calls.length, 2);
+});
+
+test('triage opens cached postings first and spends no request on them', async () => {
+  const { client, calls } = mockClient([{ status: 200, body: posting('Cached One') }, { status: 429 }]);
+  const jobs = new LinkedInJobs(client);
+  await jobs.details('7000001');
+  const r = await triageJobs(jobs, { skills: ['React'] }, ['7000002', '7000001']);
+  assert.equal(r.ranked.length, 1);
+  assert.deepEqual(r.pending, ['7000002']);
+  assert.equal(calls.length, 2);
+});
+
+test('a block soon after the previous one doubles the pause, and it survives a restart', async () => {
+  let saved: RuntimeState | undefined;
+  let t = 0;
+  const mk = (load?: RuntimeState) =>
+    new LinkedInHttpClient({
+      getCookies: () => SESSION, minIntervalMs: 0, sleep: async () => {}, now: () => t,
+      fetchImpl: (async () => new Response('', { status: 429 })) as unknown as typeof fetch,
+      saveRuntime: (r) => (saved = r), loadRuntime: load ? () => load : undefined,
+    });
+  const first = mk();
+  await assert.rejects(first.get('https://www.linkedin.com/jobs-guest/x', { useSession: false }), /Paused for 15 min/);
+  t += 16 * 60 * 1000; // first pause is over
+  const second = mk(saved);
+  await assert.rejects(second.get('https://www.linkedin.com/jobs-guest/x', { useSession: false }), /Paused for 30 min.*block 2/);
+  assert.equal(saved?.strikes, 2);
+  t += 31 * 60 * 1000;
+  await assert.rejects(mk(saved).get('https://www.linkedin.com/jobs-guest/x', { useSession: false }), /Paused for 60 min/);
+  t += 3 * 60 * 60 * 1000; // quiet for 3 h: back to 15 min
+  await assert.rejects(mk(saved).get('https://www.linkedin.com/jobs-guest/x', { useSession: false }), /Paused for 15 min/);
 });

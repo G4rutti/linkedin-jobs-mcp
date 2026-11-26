@@ -10,6 +10,7 @@ import { TtlCache } from './cache.js';
 import { LinkedInHttpClient } from './http-client.js';
 import { DATE_POSTED, DETAILS_TTL_MS, EXPERIENCE, EXTRAS_TTL_MS, JOB_TYPE, LinkedInJobs, SORT, WORK_TYPE, type JobDetails } from './linkedin.js';
 import { JobWatcher } from './watch.js';
+import { triageJobs } from './triage.js';
 import { fetchOwnProfile, importFromText } from './profile-import.js';
 import { COMPANY_SECTIONS, PERSON_SECTIONS, companyFrom, fetchCompany, fetchPerson, usernameFrom } from './person.js';
 import { LANG_LEVELS, SENIORITY, analyzeFit, clearProfile, loadProfile, profileExcludes, profilePath, saveProfile, type Profile } from './profile.js';
@@ -44,7 +45,7 @@ const jobs = new LinkedInJobs(http, () => profileExcludes(loadProfile()), {
   extras: new TtlCache<Record<string, unknown>>(EXTRAS_TTL_MS, 300, Date.now, jsonFileStore<Record<string, unknown>>(extrasCachePath)),
 });
 const watcher = new JobWatcher(jobs);
-const server = new McpServer({ name: 'linkedin-jobs', version: '0.5.1' });
+const server = new McpServer({ name: 'linkedin-jobs', version: '0.5.2' });
 
 const text = (value: unknown) => ({
   content: [{ type: 'text' as const, text: typeof value === 'string' ? value : JSON.stringify(value, null, 2) }],
@@ -111,6 +112,7 @@ server.tool('session-status', 'Show whether a LinkedIn session is saved, any act
       user: session.userName || undefined,
       savedAt: session.savedAt || undefined,
       pausedForSeconds: http.cooldownRemainingSeconds(),
+      blocksInARow: http.strikes,
       // withSession=false means LinkedIn blocked the public endpoint by IP, not your account.
       lastBlock: http.lastBlock,
       requestsThisRun: http.requestCount,
@@ -281,39 +283,13 @@ server.tool('clear-profile', 'Delete the saved profile.', {}, () => run(() => (c
 
 server.tool(
   'triage-jobs',
-  'Open several postings and rank them against your profile: good, stretch, unknown, blocked, with the reasons (years asked, languages, visa, stack overlap). Use it on ids from search-jobs or fresh-jobs before reading descriptions one by one. One public request per job not already cached; it skips the logged-in extras, which the ranking does not use.',
+  'Open several postings and rank them against your profile: good, stretch, unknown, blocked, with the reasons (years asked, languages, visa, stack overlap). Use it on ids from search-jobs or fresh-jobs before reading descriptions one by one. One public request per job not already cached (cached ones go first); it skips the logged-in extras. If LinkedIn rate-limits midway it returns what it ranked plus the pending ids, instead of failing.',
   { jobIds: z.array(z.string().regex(/^\d{6,15}$/)).min(1).max(10) },
   ({ jobIds }) =>
     run(async () => {
       const profile = loadProfile();
       if (!profile) throw new Error('No profile yet. Call set-profile first.');
-      const order = { good: 0, stretch: 1, unknown: 2, blocked: 3 } as const;
-      const rows = [];
-      const errors: string[] = [];
-      for (const id of [...new Set(jobIds)]) {
-        try {
-          const job = await jobs.details(id, { extras: false });
-          const fit = analyzeFit(job, profile);
-          rows.push({
-            id,
-            title: job.title,
-            company: job.company,
-            location: job.location,
-            applicants: job.applicants,
-            closed: job.closed,
-            verdict: fit.verdict,
-            blockers: fit.blockers,
-            stretches: fit.stretches,
-            pluses: fit.pluses,
-            url: job.url,
-          });
-        } catch (error) {
-          if (error instanceof Error && error.name === 'RateLimitError') throw error;
-          errors.push(`${id}: ${error instanceof Error ? error.message : String(error)}`);
-        }
-      }
-      rows.sort((a, b) => order[a.verdict] - order[b.verdict] || Number(a.closed) - Number(b.closed));
-      return { ranked: rows, ...(errors.length ? { errors } : {}) };
+      return triageJobs(jobs, profile, jobIds);
     }),
 );
 
