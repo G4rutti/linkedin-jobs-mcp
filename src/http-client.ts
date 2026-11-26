@@ -140,7 +140,12 @@ export class LinkedInHttpClient {
     await this.throttle();
     const cookies = useSession && this.hasSession() ? this.opts.getCookies() : '';
 
+    // Every hop is a real request: throttle each one, and stop at the first
+    // repeated URL instead of walking a redirect loop with the session cookie.
+    const chain: string[] = [url.pathname];
+    const visited = new Set<string>([url.toString()]);
     for (let hop = 0; hop <= 5; hop++) {
+      if (hop > 0) await this.throttle();
       this.requestCount++;
       const headers: Record<string, string> = {
         'user-agent': USER_AGENT,
@@ -166,6 +171,11 @@ export class LinkedInHttpClient {
               : 'LinkedIn requires login for this page. Run login-with-browser.',
           );
         }
+        chain.push(next.pathname);
+        if (visited.has(next.toString())) {
+          throw new Error(`Redirect loop from LinkedIn (${chain.join(' -> ')}); stopped after ${hop + 1} request(s).`);
+        }
+        visited.add(next.toString());
         url = next;
         continue;
       }
@@ -175,6 +185,6 @@ export class LinkedInHttpClient {
       if (!res.ok) throw new Error(`HTTP ${res.status} from LinkedIn (${url.pathname})`);
       return { status: res.status, url: url.toString(), text };
     }
-    throw new Error('Too many redirects from LinkedIn.');
+    throw new Error(`Too many redirects from LinkedIn (${chain.join(' -> ')}).`);
   }
 }

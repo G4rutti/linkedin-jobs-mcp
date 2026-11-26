@@ -44,7 +44,7 @@ const jobs = new LinkedInJobs(http, () => profileExcludes(loadProfile()), {
   extras: new TtlCache<Record<string, unknown>>(EXTRAS_TTL_MS, 300, Date.now, jsonFileStore<Record<string, unknown>>(extrasCachePath)),
 });
 const watcher = new JobWatcher(jobs);
-const server = new McpServer({ name: 'linkedin-jobs', version: '0.5.0' });
+const server = new McpServer({ name: 'linkedin-jobs', version: '0.5.1' });
 
 const text = (value: unknown) => ({
   content: [{ type: 'text' as const, text: typeof value === 'string' ? value : JSON.stringify(value, null, 2) }],
@@ -149,7 +149,7 @@ server.tool(
 
 server.tool(
   'get-job-details',
-  'Full posting: description, criteria, applicants, visaMentions (visa/relocation phrases in the ad; empty = not stated) and visaNegatives. When logged in, adds exact publish time, applicant count and whether you already applied. Cached: the posting for 6 h, the logged-in extras for 1 h (see cachedAt).',
+  'Full posting: description, criteria, applicants, visaMentions (visa/relocation phrases in the ad; empty = not stated) and visaNegatives. The logged-in extras (exact publish time, applicant count, already applied) are off by default because they call the LinkedIn internal API with your cookie; set LINKEDIN_EXTRAS=1 to enable them. Cached: the posting for 6 h, the logged-in extras for 1 h (see cachedAt).',
   {
     jobId: z.string().regex(/^\d{6,15}$/, 'Numeric LinkedIn job id').describe('Job id from search-jobs or fresh-jobs'),
     refresh: z.boolean().optional().describe('Ignore the cache and fetch again (costs requests)'),

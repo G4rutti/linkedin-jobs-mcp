@@ -50,3 +50,10 @@ O throttle só espaça as requisições. Estas mudanças cortam requisições qu
 | Pausa de 15 min | só em memória: reiniciar o servidor liberava | salva em `runtime.json`; o servidor reiniciado continua respeitando |
 
 `session-status` agora mostra o `lastBlock` (endpoint e se a requisição levava a sua sessão). `withSession: false` significa que o LinkedIn barrou o endpoint público pelo IP, não a sua conta. As ferramentas devolvem `requests` pra mostrar quantas requisições de fato foram feitas.
+
+## Ajustes 0.5.1 (26/11/2026)
+
+Achados ao ler o `session-status` depois do primeiro uso real:
+
+- **Redirecionamento em loop com o cookie:** o `get-job-details` logado deu "Too many redirects". Antes, cada salto era uma requisição de verdade e só a primeira passava pelo throttle: um loop disparava até 6 requisições seguidas, sem espaço, levando o cookie. Agora cada salto passa pelo throttle e o primeiro URL repetido para tudo, com o caminho percorrido (só caminhos, nunca cookie) na mensagem de erro.
+- **Extras logados agora são opt-in** (`LINKEDIN_EXTRAS=1`). Eles chamam a API interna do LinkedIn com o seu cookie, nunca foram verificados ao vivo e falharam nas 5 vezes em que rodaram. É a requisição de maior risco pra conta, e o que ela entrega (contagem de candidatos, "já me candidatei") não vale isso.

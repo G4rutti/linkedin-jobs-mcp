@@ -219,6 +219,9 @@ export const EXTRAS_TTL_MS = 60 * 60 * 1000;
 export class LinkedInJobs {
   readonly caches: Required<JobsCaches>;
   private extrasOffUntil = 0;
+  // The logged-in extras call LinkedIn's internal API with your cookie, which is the
+  // riskiest request this server makes and was never verified live. Opt-in only.
+  private extrasEnabled = process.env.LINKEDIN_EXTRAS === '1';
 
   constructor(
     private http: LinkedInHttpClient,
@@ -287,7 +290,7 @@ export class LinkedInJobs {
    * One public request per job (cached for hours), plus one logged-in request
    * for the extras only when `extras` is true and a session exists.
    */
-  async details(rawId: string, { extras = true, refresh = false }: { extras?: boolean; refresh?: boolean } = {}) {
+  async details(rawId: string, { extras, refresh = false }: { extras?: boolean; refresh?: boolean } = {}) {
     const id = assertJobId(rawId);
     const hit = refresh ? undefined : this.caches.details.get(id);
     let job: JobDetails;
@@ -301,7 +304,8 @@ export class LinkedInJobs {
       job = parseJobHtml(id, res.text);
       this.caches.details.set(id, job);
     }
-    const extra = extras && this.http.hasSession() ? await this.sessionExtras(id, refresh) : undefined;
+    const wantExtras = extras ?? this.extrasEnabled;
+    const extra = wantExtras && this.http.hasSession() ? await this.sessionExtras(id, refresh) : undefined;
     return { ...job, ...(cachedAt ? { cachedAt } : {}), ...(extra ? { session: extra } : {}) };
   }
 

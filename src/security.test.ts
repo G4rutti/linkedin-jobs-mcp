@@ -202,3 +202,34 @@ test('the rate-limit pause survives a restart and records who was blocked', asyn
   await assert.rejects(restarted.get('https://www.linkedin.com/jobs/y'), /Paused/);
   assert.equal(calls, 0);
 });
+
+test('a redirect loop stops at the first repeated URL instead of walking 6 hops', async () => {
+  const { client, calls } = mockClient([
+    { status: 302, location: 'https://www.linkedin.com/voyager/api/x' },
+    { status: 302, location: 'https://www.linkedin.com/voyager/api/x' },
+    { status: 302, location: 'https://www.linkedin.com/voyager/api/x' },
+  ]);
+  await assert.rejects(client.get('https://www.linkedin.com/voyager/api/x'), /Redirect loop.*\/voyager\/api\/x -> \/voyager\/api\/x/);
+  assert.equal(calls.length, 1);
+});
+
+test('every redirect hop goes through the throttle', async () => {
+  let t = 0;
+  let sleeps = 0;
+  const responses = [{ status: 302, location: '/jobs/b' }, { status: 302, location: '/jobs/c' }, { status: 200 }];
+  const fetchImpl = (async () => {
+    const r = responses.shift()!;
+    return new Response('ok', { status: r.status, headers: r.location ? { location: r.location } : {} });
+  }) as unknown as typeof fetch;
+  const client = new LinkedInHttpClient({ getCookies: () => SESSION, fetchImpl, minIntervalMs: 1000, jitterFactor: 0, now: () => t, sleep: async (ms) => { sleeps++; t += ms; } });
+  await client.get('https://www.linkedin.com/jobs/a');
+  assert.equal(sleeps, 3);
+});
+
+test('logged-in extras are off by default, even with a session', async () => {
+  const html = '<h2 class="top-card-layout__title">Dev</h2><div class="show-more-less-html__markup">React</div>';
+  const { client, calls } = mockClient([{ status: 200, body: html }]);
+  await new LinkedInJobs(client).details('5489680030');
+  assert.equal(calls.length, 1);
+  assert.ok(!calls.some((c) => c.url.includes('/voyager/')));
+});
